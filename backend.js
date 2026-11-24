@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "web-1.18.0";
+  const VERSION = "web-1.18.1";
   const P = window.PTParser;
   const CONTROL_RX = /^PT-\d{6}-\d{4}$/;
   const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"];

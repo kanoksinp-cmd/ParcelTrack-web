@@ -1113,8 +1113,9 @@
       if (!sel) return box.setAttribute("hidden", "");
       const r = canvas.getBoundingClientRect(), s = stage.getBoundingClientRect();
       box.removeAttribute("hidden");
-      box.style.left = (r.left - s.left + sel.x * r.width) + "px";
-      box.style.top = (r.top - s.top + sel.y * r.height) + "px";
+      // กรอบอยู่ในพื้นที่ที่เลื่อนได้ (crop-stage) ต้องบวกระยะที่เลื่อนไปแล้ว ไม่งั้นกรอบจะเพี้ยนจากจุดที่ลาก
+      box.style.left = (r.left - s.left + stage.scrollLeft + sel.x * r.width) + "px";
+      box.style.top = (r.top - s.top + stage.scrollTop + sel.y * r.height) + "px";
       box.style.width = sel.w * r.width + "px";
       box.style.height = sel.h * r.height + "px";
     };
