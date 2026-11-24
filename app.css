@@ -586,3 +586,14 @@ table.wd-table small { font-size: 11px; }
 .cr-tip { font-size: 12.5px; color: var(--muted); }
 .cr-empty { font-size: 13px; color: var(--danger); }
 .cr-opt.best { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; }
+
+/* ช่องที่อ่านได้แต่ไม่ชัด (ส้ม) และช่องที่เติมจากค่าที่เคยแก้ (ฟ้า) */
+.field input.unsure, .field textarea.unsure { border-color: #E8833A; background: #FFF4EC; box-shadow: 0 0 0 3px rgba(232,131,58,.12); }
+.field input.remembered, .field textarea.remembered { border-color: #6AA7D8; background: #F1F7FD; }
+/* ลากภาพมาวางได้ทุกหน้า */
+.drop-overlay { position: fixed; inset: 0; z-index: 9000; display: none; place-items: center; background: rgba(14,107,99,.12);
+  border: 3px dashed #0E6B63; pointer-events: none; }
+.drop-overlay.show { display: grid; }
+.drop-overlay > div { display: flex; flex-direction: column; align-items: center; gap: 10px; background: #fff; padding: 22px 30px;
+  border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.12); font-size: 16px; color: #0E6B63; }
+.drop-overlay svg { width: 34px; height: 34px; }

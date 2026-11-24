@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "web-1.17.2";
+  const VERSION = "web-1.18.0";
   const P = window.PTParser;
   const CONTROL_RX = /^PT-\d{6}-\d{4}$/;
   const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"];
@@ -100,6 +100,7 @@
     orders.clear(); os.forEach((o) => orders.set(o.id, o));
     withdrawals.clear(); ws.forEach((w) => withdrawals.set(w.id, w));
     await loadImages();
+    try { corrections = (await getMeta("corrections")) || {}; } catch { corrections = {}; }
     lastLoad = Date.now();
   }
 
@@ -210,6 +211,48 @@
     return run;
   }
 
+  // ---------- จำค่าที่เคยแก้ ----------
+  // ตอนบันทึก เทียบค่าที่ OCR อ่านได้กับค่าที่ผู้ใช้แก้ก่อนบันทึก แล้วจำไว้ใน Supabase (pt_meta: corrections)
+  // ครั้งหน้า OCR อ่านได้ค่าเดิม (เช่น ชื่อร้านที่อ่านเพี้ยนแบบเดิม) จะเติมค่าที่เคยแก้ให้เอง
+  const LEARN_FIELDS = ["shopName", "productName", "variant", "carrier", "recipientName", "shippingAddress", "paymentMethod"];
+  const MAX_PER_FIELD = 300;
+  let corrections = {};
+  const draftsByControl = new Map();   // ID No. -> ค่าที่ OCR อ่านได้ (ก่อนแก้)
+  const ckey = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+
+  function rememberDraft(r) {
+    const prev = draftsByControl.get(r.controlNo) || {};
+    for (const f of LEARN_FIELDS) if (prev[f] == null && r[f] != null) prev[f] = ckey(r[f]);
+    draftsByControl.set(r.controlNo, prev);
+  }
+  function applyCorrections(r) {
+    r.rememberedFields = [];
+    for (const f of LEARN_FIELDS) {
+      const fixed = r[f] != null ? corrections[f]?.[ckey(r[f])] : null;
+      if (fixed == null || fixed === r[f]) continue;
+      r[f] = fixed;
+      r.rememberedFields.push(f);
+      if (r.unsureReasons) delete r.unsureReasons[f];
+    }
+    if (r.unsureReasons) r.unsureFields = Object.keys(r.unsureReasons);
+  }
+  async function learnCorrections(controlNo, body) {
+    const raw = controlNo && draftsByControl.get(controlNo);
+    if (!raw) return;
+    draftsByControl.delete(controlNo);
+    let changed = false;
+    for (const f of LEARN_FIELDS) {
+      const from = raw[f], to = ckey(body[f]);
+      if (!from || !to) continue;
+      const map = (corrections[f] ||= {});
+      if (from !== to && map[from] !== to) { delete map[from]; map[from] = to; changed = true; }
+      else if (from === to && map[from] != null) { delete map[from]; changed = true; }   // ผู้ใช้ยืนยันค่าที่ OCR อ่าน ไม่ต้องแก้แล้ว
+      const keys = Object.keys(map);
+      if (keys.length > MAX_PER_FIELD) { keys.slice(0, keys.length - MAX_PER_FIELD).forEach((k) => delete map[k]); changed = true; }
+    }
+    if (changed) await setMeta("corrections", corrections);
+  }
+
   // ---------- ตัวช่วยตอบกลับ ----------
   class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
   const bad = (msg) => { throw new HttpError(400, msg); };
@@ -249,7 +292,7 @@
     return all.find((o) => same(o.trackingNumber, tracking) || same(o.orderNumber, orderNo) || same(o.referenceNumber, refNo)) || null;
   }
 
-  const normalizeTracking = (s) => (s == null ? null : s.toUpperCase().split(" ").join("").split("O").join("0"));
+  const normalizeTracking = (s) => (s == null ? null : P.fixTracking(s));
 
   function findDuplicate(all, r, selfId) {
     const tr = trimOrNull(r.trackingNumber) ? normalizeTracking(String(r.trackingNumber).trim()) : null;
@@ -448,6 +491,8 @@
       return json(result);
     }
     result.controlNo = sessionFree ? sessionNo : await nextControlNo();
+    rememberDraft(result);
+    applyCorrections(result);
     return json(result);
   });
 
@@ -511,6 +556,7 @@
     const o = newOrder();
     apply(o, body);
     await putOrder(o);
+    learnCorrections(o.controlNo, body).catch((e) => console.warn("จำค่าที่แก้ไม่สำเร็จ", e));
     return json(o, 201);
   });
 

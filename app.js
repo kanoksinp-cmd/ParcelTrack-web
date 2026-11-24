@@ -283,7 +283,7 @@
     drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $picker.click(); } });
     drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
     drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-    drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); runOcr([...e.dataTransfer.files]); });
+    drop.addEventListener("drop", (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.remove("over"); dragDepth = 0; dropOverlay.classList.remove("show"); runOcr([...e.dataTransfer.files]); });
   }
 
   let appendNext = false;   // true = ภาพที่เลือกถัดไปจะรวมเข้ากับข้อมูลที่อ่านไว้แล้ว
@@ -292,10 +292,31 @@
     const append = appendNext; appendNext = false;
     if (f.length) runOcr(f, append);
   });
+  // วางภาพ (Ctrl+V) หรือลากภาพมาวางได้ทุกหน้า: ไปหน้าสแกนแล้วอ่านทันที
+  const typing = (el) => el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) && el.type !== "checkbox";
   document.addEventListener("paste", (e) => {
-    if (!location.hash.startsWith("#/capture")) return;
     const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
-    if (files.length) { e.preventDefault(); runOcr(files, !!draft); }
+    if (!files.length) return;
+    if (typing(e.target) && !location.hash.startsWith("#/capture")) return;
+    if (location.hash.startsWith("#/scan")) return;
+    e.preventDefault();
+    runOcr(files, location.hash.startsWith("#/capture") && !!draft);
+  });
+  const dropOverlay = document.createElement("div");
+  dropOverlay.className = "drop-overlay";
+  dropOverlay.innerHTML = `<div>${I.upload}<b>วางภาพหน้าจอเพื่ออ่านข้อมูล</b></div>`;
+  document.body.appendChild(dropOverlay);
+  let dragDepth = 0;
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+  window.addEventListener("dragenter", (e) => { if (!hasFiles(e) || location.hash.startsWith("#/scan")) return; dragDepth++; dropOverlay.classList.add("show"); });
+  window.addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; dropOverlay.classList.remove("show"); } });
+  window.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); dragDepth = 0; dropOverlay.classList.remove("show");
+    if (e.defaultPrevented && e.target.closest?.("#drop")) return;
+    const files = [...e.dataTransfer.files].filter((f) => f.type.startsWith("image/"));
+    if (files.length) runOcr(files, location.hash.startsWith("#/capture") && !!draft);
   });
 
   // ---------- การอ่านหนึ่งครั้ง = ID No. หนึ่งเลข + รูปรวมหนึ่งรูป ----------
@@ -373,6 +394,9 @@
     r.controlNo = a.controlNo || b.controlNo;
     r.screenshots = b.screenshots?.length ? b.screenshots : a.screenshots;   // รูปรวมไฟล์เดียว
     r.foundFields = [...new Set([...(a.foundFields || []), ...(b.foundFields || [])])];
+    r.unsureReasons = { ...(b.unsureReasons || {}), ...(a.unsureReasons || {}) };
+    for (const k of Object.keys(r.unsureReasons)) if (a[k] != null && a[k] !== "" && !(a.unsureReasons || {})[k]) delete r.unsureReasons[k];
+    r.rememberedFields = [...new Set([...(a.rememberedFields || []), ...(b.rememberedFields || [])])];
     r.rawText = (a.rawText || "") + "\n\n----------\n\n" + (b.rawText || "");
     r.paymentConfirmed = a.paymentConfirmed || b.paymentConfirmed;
     return r;
@@ -509,7 +533,8 @@
   }
 
   // เลขพัสดุใช้เลขศูนย์ 0 เสมอ ไม่ใช้ตัวอักษร O (ทั้งที่อ่านจากภาพและที่พิมพ์เอง)
-  const fixTracking = (v) => (v || "").toUpperCase().replace(/\s+/g, "").replace(/O/g, "0");
+  // ตัด O→0 เฉพาะส่วนที่เป็นตัวเลข (เลขของ Lazada ขึ้นต้น LEXDO… ไม่ถูกแก้ผิด)
+  const fixTracking = (v) => window.PTParser.fixTracking(v || "");
 
   // ---------- อ่าน QR / บาร์โค้ดจากรูปถ่ายกล่องพัสดุ ----------
   // รูปถ่ายกล่องทั้งใบ โค้ดจะเล็กมากเมื่อเทียบกับทั้งภาพ อ่านทั้งรูปทีเดียวมักไม่ออก
@@ -978,6 +1003,9 @@
     const v = {};
     f.querySelectorAll("[name]").forEach((el) => { v[el.name] = el.type === "checkbox" ? el.checked : el.value; });
     const w = fieldWarnings(v);
+    f.querySelectorAll(".unsure[data-why]").forEach((el) => {
+      if (!w.some(([n]) => n === el.name)) w.unshift([el.name, el.dataset.why + " — เทียบกับรูปอีกครั้ง"]);
+    });
     if (!w.length) {
       box.innerHTML = `<div class="warn-ok">${I.check}ตรวจแล้ว ช่องสำคัญครบและดูสมเหตุสมผล</div>`;
       return;
@@ -1184,6 +1212,12 @@
     const shots = d.screenshots || [];
     const found = (d.foundFields || []).length;
     const miss = (v) => (v == null || v === "" ? " missing" : "");
+    const unsure = editingId ? {} : (d.unsureReasons || {});
+    const remembered = new Set(editingId ? [] : (d.rememberedFields || []));
+    // missing = อ่านไม่ได้ (เหลือง) · unsure = อ่านได้แต่ไม่ชัด ควรตรวจ (ส้ม) · remembered = ใช้ค่าที่เคยแก้ไว้ (ฟ้า)
+    const cls = (n) => miss(d[n]) || (unsure[n] ? " unsure" : remembered.has(n) ? " remembered" : "");
+    const why = (n) => (unsure[n] ? ` data-why="${esc(unsure[n])}" title="${esc(unsure[n])}"` : remembered.has(n) ? ' title="ใช้ค่าที่คุณเคยแก้ไว้"' : "");
+    const nUnsure = Object.keys(unsure).filter((k) => d[k] != null && d[k] !== "").length;
     const dtLocal = d.orderedAt ? String(d.orderedAt).slice(0, 16) : "";
     $view.innerHTML = `
       <div class="topbar"><a class="icon-btn ghost" href="${editingId ? "#/order/" + editingId : "#/"}" aria-label="กลับ">${I.back}</a>
@@ -1196,30 +1230,32 @@
             <b style="font-size:15px">${editingId ? "รูปรวมภาพหน้าจอ" : `อ่านจากภาพหน้าจอ ${d.imageCount || 1} ภาพ`}</b>
             ${shots.length ? `<span class="muted" style="font-size:12px;word-break:break-all">บันทึกรูปเป็น ${esc(shots[0])}</span>` : ""}
             ${editingId ? "" : `<span class="okline${found < 9 ? " warn" : ""}">${found < 9 ? I.alert : I.check}อ่านได้ ${found}/${FIELD_COUNT} ช่อง</span>
+            ${nUnsure ? `<span class="okline warn" style="color:#B4541A">${I.alert}ควรตรวจ ${nUnsure} ช่อง (สีส้ม = อ่านไม่ชัด)</span>` : ""}
+            ${remembered.size ? `<span class="muted" style="font-size:12px">สีฟ้า = เติมจากค่าที่คุณเคยแก้ไว้ ${remembered.size} ช่อง</span>` : ""}
             ${found < FIELD_COUNT ? '<span class="muted" style="font-size:12px">ช่องสีเหลืองอ่านไม่ได้ กรอกเพิ่มหรือเพิ่มภาพ</span>' : '<span class="muted" style="font-size:12px">ตรวจความถูกต้อง แตะช่องไหนก็แก้ได้</span>'}`}
             ${editingId ? "" : `<button type="button" class="btn small" id="more" style="align-self:flex-start">+ เพิ่มภาพ (ID No. เดิม)</button>`}
           </div></div>` : ""}
 
         <div class="section-label">สินค้า</div>
         <div class="card form-card">
-          <label class="field">ชื่อสินค้า *<input name="productName" required value="${esc(d.productName)}" class="${miss(d.productName)}"></label>
+          <label class="field">ชื่อสินค้า *<input name="productName" required value="${esc(d.productName)}" class="${cls("productName")}"${why("productName")}></label>
           <div class="grid2">
-            <label class="field">ตัวเลือก (สี/ขนาด)<input name="variant" value="${esc(d.variant)}"></label>
+            <label class="field">ตัวเลือก (สี/ขนาด)<input name="variant" value="${esc(d.variant)}" class="${(cls("variant") || "").replace(" missing", "")}"${why("variant")}></label>
             <label class="field">จำนวน<input name="quantity" type="number" min="1" inputmode="numeric" value="${esc(d.quantity ?? 1)}"></label>
           </div>
-          <label class="field">ร้านค้า<input name="shopName" value="${esc(d.shopName)}" class="${miss(d.shopName)}"></label>
+          <label class="field">ร้านค้า<input name="shopName" value="${esc(d.shopName)}" class="${cls("shopName")}"${why("shopName")}></label>
         </div>
 
         <div class="section-label">คำสั่งซื้อ</div>
         <div class="card form-card">
-          <label class="field">หมายเลขคำสั่งซื้อ<input name="orderNumber" autocapitalize="characters" value="${esc(d.orderNumber)}" class="${miss(d.orderNumber)}"></label>
+          <label class="field">หมายเลขคำสั่งซื้อ<input name="orderNumber" autocapitalize="characters" value="${esc(d.orderNumber)}" class="${cls("orderNumber")}"${why("orderNumber")}></label>
           <label class="field">หมายเลขอ้างอิง<input name="referenceNumber" autocapitalize="characters" value="${esc(d.referenceNumber)}"></label>
           <div class="grid2">
-            <label class="field">วันที่สั่งซื้อ<input name="orderedAt" type="datetime-local" value="${esc(dtLocal)}" class="${miss(d.orderedAt)}"></label>
-            <label class="field">ยอดชำระสุทธิ (บาท)<input name="totalAmount" inputmode="decimal" value="${d.totalAmount != null ? esc(Number(d.totalAmount).toFixed(2)) : ""}" class="${miss(d.totalAmount)}"></label>
+            <label class="field">วันที่สั่งซื้อ<input name="orderedAt" type="datetime-local" value="${esc(dtLocal)}" class="${cls("orderedAt")}"${why("orderedAt")}></label>
+            <label class="field">ยอดชำระสุทธิ (บาท)<input name="totalAmount" inputmode="decimal" value="${d.totalAmount != null ? esc(Number(d.totalAmount).toFixed(2)) : ""}" class="${cls("totalAmount")}"${why("totalAmount")}></label>
           </div>
           <div class="grid2">
-            <label class="field">วิธีชำระเงิน<input name="paymentMethod" list="pm" value="${esc(d.paymentMethod)}"></label>
+            <label class="field">วิธีชำระเงิน<input name="paymentMethod" list="pm" value="${esc(d.paymentMethod)}" class="${(cls("paymentMethod") || "").replace(" missing", "")}"${why("paymentMethod")}></label>
             <label class="field">หมายเลขบัตรเครดิต / เดบิต<input name="cardNumber" inputmode="numeric" autocomplete="off" maxlength="23"
               placeholder="เช่น 1234" value="${d.cardLast4 ? "•••• " + esc(d.cardLast4) : ""}"></label>
           </div>
@@ -1230,16 +1266,16 @@
 
         <div class="section-label">การจัดส่ง</div>
         <div class="card form-card key">
-          <label class="field big">เลขพัสดุ<input name="trackingNumber" autocapitalize="characters" value="${esc(d.trackingNumber)}" class="${miss(d.trackingNumber)}"></label>
-          <label class="field">บริษัทขนส่ง<input name="carrier" list="carriers" value="${esc(d.carrier)}" class="${miss(d.carrier)}"></label>
+          <label class="field big">เลขพัสดุ<input name="trackingNumber" autocapitalize="characters" value="${esc(d.trackingNumber)}" class="${cls("trackingNumber")}"${why("trackingNumber")}></label>
+          <label class="field">บริษัทขนส่ง<input name="carrier" list="carriers" value="${esc(d.carrier)}" class="${cls("carrier")}"${why("carrier")}></label>
           <datalist id="carriers"><option value="Flash Express"><option value="Kerry Express"><option value="J&amp;T Express"><option value="SPX Express"><option value="ไปรษณีย์ไทย"><option value="Ninja Van"><option value="Lazada Express"><option value="Best Express"><option value="DHL eCommerce"></datalist>
-          <div class="hint">${I.qr}<span>เลขนี้ใช้จับคู่ตอนยิง QR / บาร์โค้ดบนกล่อง เมื่อพัสดุมาส่ง · ตัว O จะถูกเปลี่ยนเป็นเลข 0 ให้อัตโนมัติ</span></div>
+          <div class="hint">${I.qr}<span>เลขนี้ใช้จับคู่ตอนยิง QR / บาร์โค้ดบนกล่อง เมื่อพัสดุมาส่ง · ตัว O ในส่วนที่เป็นตัวเลขจะถูกเปลี่ยนเป็นเลข 0 ให้อัตโนมัติ</span></div>
         </div>
 
         <div class="section-label">ผู้รับ / ที่อยู่จัดส่ง</div>
         <div class="card form-card">
-          <label class="field">ชื่อผู้รับ<input name="recipientName" value="${esc(d.recipientName)}" class="${miss(d.recipientName)}"></label>
-          <label class="field">ที่อยู่ในการจัดส่ง<textarea name="shippingAddress" rows="2" class="${miss(d.shippingAddress)}">${esc(d.shippingAddress)}</textarea></label>
+          <label class="field">ชื่อผู้รับ<input name="recipientName" value="${esc(d.recipientName)}" class="${cls("recipientName")}"${why("recipientName")}></label>
+          <label class="field">ที่อยู่ในการจัดส่ง<textarea name="shippingAddress" rows="2" class="${cls("shippingAddress")}"${why("shippingAddress")}>${esc(d.shippingAddress)}</textarea></label>
         </div>
 
         <div class="section-label">หมายเหตุ</div>
@@ -1284,6 +1320,10 @@
     f.querySelectorAll('input[type=date], input[type=datetime-local]').forEach((el) =>
       el.addEventListener("change", () => el.blur()));
     f.querySelectorAll("input.missing, textarea.missing").forEach((i) => i.addEventListener("input", () => i.classList.toggle("missing", !i.value)));
+    // แก้ช่องสีส้ม/ฟ้าแล้ว ถือว่าตรวจแล้ว เอาสีออก
+    f.querySelectorAll(".unsure, .remembered").forEach((i) => i.addEventListener("input", () => {
+      i.classList.remove("unsure", "remembered"); delete i.dataset.why; renderWarnings(f);
+    }));
     // พิมพ์ตัว O ในช่องเลขพัสดุ ให้กลายเป็นเลข 0 ทันที
     f.trackingNumber?.addEventListener("input", (e) => {
       const el = e.target, pos = el.selectionStart, fixed = fixTracking(el.value);
@@ -1836,10 +1876,11 @@
     });
   }
 
-  // ---------- มือถือ & สำรองข้อมูล (ข้อมูลอยู่บน Supabase ใช้ร่วมกันทุกเครื่องที่ล็อกอินบัญชีเดียวกัน) ----------
+  // ---------- มือถือ & สำรองข้อมูล (ข้อมูลอยู่บน Supabase ใช้ร่วมกันทุกเครื่อง ไม่ต้องล็อกอิน) ----------
   async function phone() {
     const info = await window.PTBackend.storageInfo();
-    const pair = window.PTBackend.pairLink();
+    const site = location.href.split("#")[0];
+    const online = /^https:$/.test(location.protocol);
     const qr = (text) => {
       const q = qrcode(0, "M"); q.addData(text); q.make();
       return q.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
@@ -1847,23 +1888,22 @@
 
     $view.innerHTML = `
       <div class="page-head"><div><h1>มือถือ &amp; สำรองข้อมูล</h1>
-        <p>ข้อมูลเก็บบน Supabase มือถือกับคอมที่เชื่อมแล้วเห็นข้อมูลชุดเดียวกัน ไม่ต้องล็อกอิน</p></div></div>
+        <p>ข้อมูลเก็บบน Supabase เปิดเว็บนี้บนมือถือหรือคอมก็เห็นข้อมูลชุดเดียวกัน ไม่ต้องล็อกอิน</p></div></div>
       <div class="phone-grid">
         <div class="stack">
-          ${pair ? `
+          ${online ? `
           <div class="card qr-card secure">
-            <div class="qr-tag green">เชื่อมมือถือ / เครื่องอื่น</div>
-            <div class="qr" id="pairQr"><button class="btn block" id="showPair">แสดง QR เชื่อมเครื่อง</button></div>
-            <p class="qr-note">ส่อง QR นี้ด้วยกล้องมือถือครั้งเดียว มือถือจะเปิดเว็บและเชื่อมต่อให้เอง ไม่ต้องล็อกอิน
-              (กด แชร์ &gt; "เพิ่มไปยังหน้าจอโฮม" เพื่อใช้แบบแอป)<br>
-              <b>QR / ลิงก์นี้เปรียบเหมือนกุญแจ อย่าส่งให้คนอื่น</b></p>
+            <div class="qr-tag green">เปิดบนมือถือ</div>
+            <div class="qr">${qr(site)}</div>
+            <div class="qr-url">${esc(site)}</div>
+            <p class="qr-note">ส่องด้วยกล้องมือถือเพื่อเปิดเว็บนี้ ใช้ข้อมูลชุดเดียวกันได้ทันที
+              (กด แชร์ &gt; "เพิ่มไปยังหน้าจอโฮม" เพื่อใช้แบบแอป)</p>
           </div>` : ""}
           <div class="card" style="padding:18px 20px">
             <h2 style="margin:0 0 8px;font-size:18px">ข้อมูลบน Supabase</h2>
             <p>คำสั่งซื้อ <b>${info.orders}</b> รายการ · ยอดเบิก <b>${info.withdrawals}</b> รายการ · รูป <b>${info.images}</b> รูป</p>
             <div class="row" style="display:flex;gap:10px;margin-top:10px">
               <button class="btn" id="acRefresh" style="flex:1">ดึงข้อมูลล่าสุด</button>
-              <button class="btn" id="acOut" style="flex:1">เลิกเชื่อมเครื่องนี้</button>
             </div>
           </div>
         </div>
@@ -1885,17 +1925,11 @@
         </div>
       </div>
       <div class="card tips"><b>ควรรู้</b><br>
-        • เฉพาะเครื่องที่เชื่อมแล้วเท่านั้นที่อ่าน/แก้ข้อมูลได้ คนที่รู้แค่ลิงก์เว็บเปิดข้อมูลไม่ได้<br>
+        • ไม่มีการล็อกอิน ใครที่รู้ลิงก์เว็บนี้จะเห็นและแก้ข้อมูลได้ อย่าแชร์ลิงก์ และกดดาวน์โหลดไฟล์สำรองไว้เป็นระยะ<br>
         • อีกเครื่องเพิ่มรายการใหม่ กลับมาที่หน้านี้หรือกด "ดึงข้อมูลล่าสุด" จะเห็นทันที<br>
         • การอ่านภาพทำในเครื่องนี้ ครั้งแรกจะโหลดตัวอ่านภาพประมาณ 10 MB หลังจากนั้นเร็วขึ้น<br>
         • Supabase แพ็กเกจฟรีจะหยุด project ถ้าไม่มีการใช้งาน 7 วัน ให้เข้าไปกด Restore ที่ supabase.com</div>`;
 
-    $view.querySelector("#acOut").addEventListener("click", () => {
-      if (confirm("เลิกเชื่อมเครื่องนี้? ข้อมูลบน Supabase ไม่หาย แต่ต้องเปิดลิงก์เชื่อมเครื่องใหม่ถึงจะใช้ได้อีก")) window.PTBackend.signOut();
-    });
-    $view.querySelector("#showPair")?.addEventListener("click", () => {
-      $view.querySelector("#pairQr").innerHTML = qr(pair);
-    });
     $view.querySelector("#acRefresh").addEventListener("click", async () => {
       try { await window.PTBackend.reload(); toast("ดึงข้อมูลล่าสุดแล้ว"); phone(); }
       catch (err) { toast(err?.message || String(err), true); }
