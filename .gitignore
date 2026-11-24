@@ -1,0 +1,6 @@
+data/
+ParcelTrack-backup-*.json
+*.xlsx
+*.zip
+.DS_Store
+Thumbs.db

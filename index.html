@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0E6B63">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="ParcelTrack">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <title>ParcelTrack</title>
+  <link rel="stylesheet" href="app.css?v=web-1.16.0">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <span class="brand-mark"><svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg></span>
+        ParcelTrack
+      </a>
+      <nav class="side-nav">
+        <a href="#/" data-nav="home"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/></svg>หน้าหลัก</a>
+        <a href="#/orders" data-nav="orders"><svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>คำสั่งซื้อ</a>
+        <a href="#/capture" data-nav="capture"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 9h8M8 12h8M8 15h5"/></svg>สแกนภาพหน้าจอ</a>
+        <a href="#/scan" data-nav="scan"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/><path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 18h2M18 14h2"/></svg>ยิง QR รับพัสดุ</a>
+        <a href="#/report" data-nav="report"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>รายงานสรุป</a>
+        <a href="#/phone" data-nav="phone"><svg viewBox="0 0 24 24"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>มือถือ &amp; สำรองข้อมูล</a>
+      </nav>
+      <div class="side-foot">
+        <label class="scanner-box">
+          <span class="scanner-state"><i></i>ช่องรับเครื่องยิงบาร์โค้ด</span>
+          <input id="usbScan" autocomplete="off" placeholder="ยิงบาร์โค้ด / พิมพ์เลขพัสดุ แล้วกด Enter">
+        </label>
+        <a class="export" href="/api/export.xlsx" download>Export to Excel (.xlsx)</a>
+        <div class="version" id="ver">เวอร์ชัน …</div>
+      </div>
+    </aside>
+
+    <main id="view" class="view" tabindex="-1"></main>
+
+    <nav class="tabbar" aria-label="เมนูหลัก">
+      <a href="#/" data-nav="home"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/></svg>หน้าหลัก</a>
+      <a href="#/orders" data-nav="orders"><svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>รายการ</a>
+      <a href="#/scan" class="tab-scan" aria-label="ยิง QR พัสดุ"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/><path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 18h2M18 14h2"/></svg></a>
+      <a href="#/capture" data-nav="capture"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 9h8M8 12h8M8 15h5"/></svg>สแกนภาพ</a>
+      <a href="#/report" data-nav="report"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>รายงาน</a>
+    </nav>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <input id="filePicker" type="file" accept="image/*" multiple hidden>
+
+  <script src="vendor/html5-qrcode.min.js"></script>
+  <script src="vendor/qrcode.js"></script>
+  <script src="vendor/tesseract/tesseract.min.js"></script>
+  <script src="parser.js?v=web-1.16.0"></script>
+  <script src="backend.js?v=web-1.16.0"></script>
+  <script src="app.js?v=web-1.16.0"></script>
+</body>
+</html>
