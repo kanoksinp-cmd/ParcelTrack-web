@@ -1860,9 +1860,7 @@
           </div>` : ""}
           <div class="card" style="padding:18px 20px">
             <h2 style="margin:0 0 8px;font-size:18px">ข้อมูลบน Supabase</h2>
-            <p>คำสั่งซื้อ <b>${info.orders}</b> รายการ · ยอดเบิก <b>${info.withdrawals}</b> รายการ · รูป <b>${info.images}</b> รูป<br>
-              ${info.offline ? '<b style="color:#B42318">ออฟไลน์</b> · ' : ""}${info.pending ? `<b style="color:#B54708">รอส่งขึ้น ${info.pending} งาน</b>` : "ข้อมูลตรงกับ Supabase แล้ว"}<br>
-              สำรองล่าสุด: ${info.lastBackup ? dt(new Date(info.lastBackup)) : "ยังไม่เคย"}</p>
+            <p>คำสั่งซื้อ <b>${info.orders}</b> รายการ · ยอดเบิก <b>${info.withdrawals}</b> รายการ · รูป <b>${info.images}</b> รูป</p>
             <div class="row" style="display:flex;gap:10px;margin-top:10px">
               <button class="btn" id="acRefresh" style="flex:1">ดึงข้อมูลล่าสุด</button>
               <button class="btn" id="acOut" style="flex:1">เลิกเชื่อมเครื่องนี้</button>
@@ -1870,15 +1868,6 @@
           </div>
         </div>
         <div class="stack">
-          <div class="card" style="padding:18px 20px">
-            <h2 style="margin:0 0 8px;font-size:18px">ตัวอ่านภาพ (OCR)</h2>
-            <p>ในเครื่อง (ฟรี) ใช้ได้เสมอ · Google Vision อ่านภาษาไทยแม่นกว่า มีค่าใช้จ่ายหลังเกิน 1,000 ภาพ/เดือน
-              (ต้องตั้ง API key ก่อน ดู README) ถ้า Google Vision ใช้ไม่ได้ จะกลับไปอ่านในเครื่องให้เอง</p>
-            <select id="ocrEngine" style="width:100%;padding:10px;border-radius:12px;border:1px solid var(--line);font:inherit;margin-top:8px">
-              <option value="local">อ่านในเครื่อง (Tesseract)</option>
-              <option value="vision">Google Vision (แม่นกว่า)</option>
-            </select>
-          </div>
           <div class="card" style="padding:18px 20px">
             <h2 style="margin:0 0 8px;font-size:18px">สำรองข้อมูล</h2>
             <p>ดาวน์โหลดไฟล์ .json ที่มีคำสั่งซื้อ ยอดเบิก และรูปทั้งหมด เก็บไว้เป็นสำเนาสำรองนอก Supabase</p>
@@ -1904,9 +1893,6 @@
     $view.querySelector("#acOut").addEventListener("click", () => {
       if (confirm("เลิกเชื่อมเครื่องนี้? ข้อมูลบน Supabase ไม่หาย แต่ต้องเปิดลิงก์เชื่อมเครื่องใหม่ถึงจะใช้ได้อีก")) window.PTBackend.signOut();
     });
-    const $eng = $view.querySelector("#ocrEngine");
-    $eng.value = window.PTBackend.ocrEngine();
-    $eng.addEventListener("change", () => { window.PTBackend.setOcrEngine($eng.value); toast("เปลี่ยนตัวอ่านภาพแล้ว"); });
     $view.querySelector("#showPair")?.addEventListener("click", () => {
       $view.querySelector("#pairQr").innerHTML = qr(pair);
     });

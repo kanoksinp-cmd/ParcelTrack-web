@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "web-1.18.0";
+  const VERSION = "web-1.17.1";
   const P = window.PTParser;
   const CONTROL_RX = /^PT-\d{6}-\d{4}$/;
   const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"];
@@ -54,50 +54,16 @@
   const imageUrls = new Map();    // ชื่อไฟล์ -> URL ที่ใช้กับ <img src> (signed URL หรือ blob:)
   const localBlobs = new Map();   // รูปที่เพิ่งอัปโหลดจากเครื่องนี้ (ไม่ต้องดาวน์โหลดซ้ำ)
 
-  // ข้อผิดพลาดจากเน็ตหลุด (ใช้ตัดสินว่าจะเก็บงานไว้ส่งทีหลังหรือไม่)
-  const isNetMsg = (m) => /failed to fetch|networkerror|network request failed|load failed|fetch failed|timeout|ERR_INTERNET|ERR_NETWORK/i.test(String(m || ""));
   function check({ data, error }) {
-    if (error) {
-      const e = new Error("ติดต่อฐานข้อมูลไม่สำเร็จ: " + (error.message || error));
-      e.net = !navigator.onLine || isNetMsg(error.message) || isNetMsg(error.name) || error.status === 0;
-      throw e;
-    }
+    if (error) throw new Error("ติดต่อฐานข้อมูลไม่สำเร็จ: " + (error.message || error));
     return data;
   }
-  const netErr = (e) => !!(e && (e.net || !navigator.onLine || isNetMsg(e.message) || e.name === "TypeError"));
-
-  // ---------- ที่เก็บในเครื่อง (IndexedDB): สำเนาข้อมูลล่าสุด + คิวงานตอนออฟไลน์ ----------
-  const local = (() => {
-    let dbp;
-    const open = () => dbp ||= new Promise((res, rej) => {
-      const r = indexedDB.open("parceltrack-cache", 1);
-      r.onupgradeneeded = () => r.result.createObjectStore("kv");
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    });
-    const run = async (mode, fn) => {
-      const db = await open();
-      return new Promise((res, rej) => {
-        const t = db.transaction("kv", mode), q = fn(t.objectStore("kv"));
-        t.oncomplete = () => res(q?.result);
-        t.onerror = () => rej(t.error);
-      });
-    };
-    return {
-      get: (k) => run("readonly", (s) => s.get(k)).catch(() => undefined),
-      set: (k, v) => run("readwrite", (s) => s.put(v, k)).catch(() => {}),
-    };
-  })();
-
-  const versions = new Map();     // id -> updated_at ล่าสุดที่เครื่องนี้รู้ (ใช้ตรวจการแก้ชนกันข้ามเครื่อง)
-  let offline = false;            // โหลดจากสำเนาในเครื่อง เพราะติดต่อ Supabase ไม่ได้
-  let outbox = [];                // งานที่รอส่งขึ้น Supabase
 
   async function selectAll(table) {
     const out = [];
     for (let from = 0; ; from += 1000) {
-      const rows = check(await sb.from(table).select("id, data, updated_at").order("id").range(from, from + 999));
-      out.push(...rows);
+      const rows = check(await sb.from(table).select("data").order("id").range(from, from + 999));
+      out.push(...rows.map((r) => r.data));
       if (rows.length < 1000) break;
     }
     return out;
@@ -128,96 +94,32 @@
     if (renew || missing.length) signedAt = Date.now();
   }
 
-  const snapKey = () => "snapshot:" + uid;
-  const saveSnapshot = () => local.set(snapKey(), {
-    at: Date.now(), orders: [...orders.values()], withdrawals: [...withdrawals.values()], versions: [...versions],
-  });
-
   let lastLoad = 0;
   async function loadAll() {
-    try {
-      const [os, ws] = await Promise.all([selectAll("pt_orders"), selectAll("pt_withdrawals")]);
-      orders.clear(); withdrawals.clear(); versions.clear();
-      os.forEach((r) => { orders.set(r.id, r.data); versions.set(r.id, r.updated_at); });
-      ws.forEach((r) => { withdrawals.set(r.id, r.data); versions.set(r.id, r.updated_at); });
-      // งานที่ยังค้างในคิว ทับข้อมูลที่โหลดมา (เครื่องนี้แก้ไว้ล่าสุด)
-      for (const job of outbox) applyLocal(job);
-      await loadImages();
-      offline = false;
-      lastLoad = Date.now();
-      saveSnapshot();
-    } catch (e) {
-      if (!netErr(e)) throw e;
-      const snap = await local.get(snapKey());
-      if (!snap) throw new Error("ไม่มีอินเทอร์เน็ต และเครื่องนี้ยังไม่เคยโหลดข้อมูลไว้");
-      orders.clear(); withdrawals.clear(); versions.clear();
-      snap.orders.forEach((o) => orders.set(o.id, o));
-      snap.withdrawals.forEach((w) => withdrawals.set(w.id, w));
-      (snap.versions || []).forEach(([k, v]) => versions.set(k, v));
-      for (const job of outbox) applyLocal(job);
-      offline = true;
-      notice("ออฟไลน์: ใช้ข้อมูลที่โหลดไว้ล่าสุด งานใหม่จะถูกส่งขึ้นเมื่อมีอินเทอร์เน็ต");
-    }
+    const [os, ws] = await Promise.all([selectAll("pt_orders"), selectAll("pt_withdrawals")]);
+    orders.clear(); os.forEach((o) => orders.set(o.id, o));
+    withdrawals.clear(); ws.forEach((w) => withdrawals.set(w.id, w));
+    await loadImages();
+    lastLoad = Date.now();
   }
 
-  // ---------- เขียนข้อมูล: ส่งขึ้น Supabase ทันที ถ้าเน็ตหลุดเก็บเข้าคิวไว้ส่งทีหลัง ----------
   const stampNow = () => new Date().toISOString();
-  const TABLE = { order: "pt_orders", withdrawal: "pt_withdrawals" };
-
-  function applyLocal(job) {
-    const map = job.kind === "withdrawal" ? withdrawals : orders;
-    if (job.op === "put") map.set(job.row.id, job.row);
-    if (job.op === "del") map.delete(job.id);
+  async function putOrder(o) {
+    check(await sb.from("pt_orders").upsert({ id: o.id, data: o, updated_at: stampNow() }));
+    orders.set(o.id, o);
   }
-
-  async function remotePut(kind, row, checkVersion) {
-    const table = TABLE[kind], at = stampNow(), known = versions.get(row.id);
-    if (checkVersion && known) {
-      // แก้รายการเดิม: เขียนได้เฉพาะเมื่อไม่มีเครื่องอื่นแก้ไปก่อน
-      const rows = check(await sb.from(table).update({ data: row, updated_at: at }).eq("id", row.id).eq("updated_at", known).select("updated_at"));
-      if (rows.length) { versions.set(row.id, rows[0].updated_at); return; }
-      const latest = check(await sb.from(table).select("data, updated_at").eq("id", row.id).limit(1))[0];
-      if (latest) {
-        (kind === "withdrawal" ? withdrawals : orders).set(row.id, latest.data);
-        versions.set(row.id, latest.updated_at);
-        saveSnapshot();
-        const e = new Error("รายการนี้ถูกแก้จากอีกเครื่องก่อนหน้านี้ เปิดรายการใหม่อีกครั้งเพื่อดูข้อมูลล่าสุด แล้วแก้ซ้ำ");
-        e.conflict = true;
-        throw e;
-      }
-    }
-    const rows = check(await sb.from(table).upsert({ id: row.id, data: row, updated_at: at }).select("updated_at"));
-    if (rows[0]) versions.set(row.id, rows[0].updated_at);
+  async function delOrder(id) {
+    check(await sb.from("pt_orders").delete().eq("id", id));
+    orders.delete(id);
   }
-  async function remoteDel(kind, id) {
-    check(await sb.from(TABLE[kind]).delete().eq("id", id));
-    versions.delete(id);
+  async function putWithdrawal(w) {
+    check(await sb.from("pt_withdrawals").upsert({ id: w.id, data: w, updated_at: stampNow() }));
+    withdrawals.set(w.id, w);
   }
-
-  async function queue(job) {
-    outbox.push(job);
-    await local.set("outbox:" + uid, outbox);
-    notice(`ออฟไลน์: บันทึกไว้ในเครื่องแล้ว (${outbox.length} งานรอส่ง) จะส่งขึ้นเมื่อมีอินเทอร์เน็ต`);
+  async function delWithdrawal(id) {
+    check(await sb.from("pt_withdrawals").delete().eq("id", id));
+    withdrawals.delete(id);
   }
-
-  async function write(job, checkVersion) {
-    if (!outbox.length) {
-      try {
-        if (job.op === "put") await remotePut(job.kind, job.row, checkVersion);
-        else await remoteDel(job.kind, job.id);
-        applyLocal(job); saveSnapshot();
-        return;
-      } catch (e) { if (!netErr(e)) throw e; }
-    }
-    await queue(job);          // มีงานค้างอยู่แล้ว หรือเน็ตหลุด: ต่อคิวไว้ตามลำดับ
-    applyLocal(job); saveSnapshot();
-  }
-
-  const putOrder = (o, opts = {}) => write({ op: "put", kind: "order", row: o }, opts.checkVersion);
-  const delOrder = (id) => write({ op: "del", kind: "order", id });
-  const putWithdrawal = (w) => write({ op: "put", kind: "withdrawal", row: w });
-  const delWithdrawal = (id) => write({ op: "del", kind: "withdrawal", id });
-
   async function getMeta(k) {
     const rows = check(await sb.from("pt_meta").select("value").eq("key", k).limit(1));
     return rows[0]?.value ?? null;
@@ -230,72 +132,19 @@
     const { data, error } = await sb.storage.from(BUCKET).download(`${uid}/${name}`);
     return error ? null : data;
   }
-  const imgType = (blob) => (/^image\/(jpeg|png|webp)$/.test(blob.type) ? blob.type : "image/jpeg");
-  function setLocalImage(name, blob) {
+  async function putImage(name, blob) {
+    const type = /^image\/(jpeg|png|webp)$/.test(blob.type) ? blob.type : "image/jpeg";
+    check(await sb.storage.from(BUCKET).upload(`${uid}/${name}`, blob, { upsert: true, contentType: type, cacheControl: "60" }));
     const old = imageUrls.get(name);
     if (old?.startsWith("blob:")) URL.revokeObjectURL(old);
     localBlobs.set(name, blob);
     imageUrls.set(name, URL.createObjectURL(blob));
   }
-  async function putImage(name, blob) {
-    const job = { op: "img", name, blob };
-    if (!outbox.length) {
-      try {
-        check(await sb.storage.from(BUCKET).upload(`${uid}/${name}`, blob, { upsert: true, contentType: imgType(blob), cacheControl: "60" }));
-        setLocalImage(name, blob);
-        return;
-      } catch (e) { if (!netErr(e)) throw e; }
-    }
-    await queue(job);
-    setLocalImage(name, blob);
-  }
   async function deleteImage(name) {
-    if (!outbox.length) {
-      try { check(await sb.storage.from(BUCKET).remove([`${uid}/${name}`])); }
-      catch (e) { if (!netErr(e)) throw e; await queue({ op: "imgdel", name }); }
-    } else await queue({ op: "imgdel", name });
+    check(await sb.storage.from(BUCKET).remove([`${uid}/${name}`]));
     const old = imageUrls.get(name);
     if (old?.startsWith("blob:")) URL.revokeObjectURL(old);
     imageUrls.delete(name); localBlobs.delete(name);
-  }
-
-  // ส่งงานในคิวขึ้น Supabase ตามลำดับ (เครื่องนี้แก้ล่าสุด = ใช้ของเครื่องนี้)
-  let flushing = false;
-  async function flush() {
-    if (flushing || !outbox.length || !uid) return;
-    flushing = true;
-    try {
-      while (outbox.length) {
-        const job = outbox[0];
-        if (job.op === "put") await remotePut(job.kind, job.row, false);
-        else if (job.op === "del") await remoteDel(job.kind, job.id);
-        else if (job.op === "img") check(await sb.storage.from(BUCKET).upload(`${uid}/${job.name}`, job.blob, { upsert: true, contentType: imgType(job.blob), cacheControl: "60" }));
-        else if (job.op === "imgdel") check(await sb.storage.from(BUCKET).remove([`${uid}/${job.name}`]));
-        outbox.shift();
-        await local.set("outbox:" + uid, outbox);
-      }
-      if (offline) { offline = false; await loadAll(); }
-      saveSnapshot();
-      notice("ส่งงานที่ค้างขึ้น Supabase ครบแล้ว", false);
-    } catch (e) {
-      if (!netErr(e)) {
-        // งานที่ส่งไม่ได้ด้วยเหตุอื่น (ไม่ใช่เน็ต) ข้ามไป ไม่ให้ค้างคิวตลอดไป
-        console.error("flush", e);
-        outbox.shift(); await local.set("outbox:" + uid, outbox);
-        notice("ส่งงานที่ค้างบางรายการไม่สำเร็จ: " + e.message);
-        flushing = false; return flush();
-      }
-    } finally { flushing = false; }
-  }
-  window.addEventListener("online", () => flush());
-  setInterval(() => { if (outbox.length && navigator.onLine) flush(); }, 60000);
-
-  function notice(msg, isError = true) {
-    const t = document.getElementById("toast");
-    if (!t) return;
-    t.textContent = msg; t.className = "toast show" + (isError ? " error" : "");
-    clearTimeout(notice.timer);
-    notice.timer = setTimeout(() => (t.className = "toast"), 4500);
   }
 
   // ---------- เชื่อมเครื่อง (ไม่ต้องล็อกอิน/ไม่ต้องใส่ PIN) ----------
@@ -349,17 +198,14 @@
     if (!user) user = await signInWithPair(lsGet(PAIR_KEY));
     if (!user) user = await notPairedScreen(pairFromHash ? "ลิงก์เชื่อมเครื่องไม่ถูกต้อง หรือเชื่อมต่อไม่ได้" : null);
     uid = user.id; userEmail = user.email;
-    outbox = (await local.get("outbox:" + uid)) || [];
     await loadAll();
-    if (outbox.length && navigator.onLine) flush();
-    setTimeout(backupReminder, 4000);
   })();
 
   // กลับมาที่หน้าเว็บ (เช่น สลับแอปบนมือถือ) ดึงข้อมูลล่าสุดจากอีกเครื่อง แล้ววาดหน้ารายการใหม่
   document.addEventListener("visibilitychange", async () => {
     if (document.visibilityState !== "visible" || !uid || Date.now() - lastLoad < 20000) return;
     try {
-      await ready; await flush(); await loadAll();
+      await ready; await loadAll();
       if (/^#?\/?(orders|report)?$/.test(location.hash)) window.dispatchEvent(new HashChangeEvent("hashchange"));
     } catch { /* ออฟไลน์ชั่วคราว */ }
   });
@@ -370,14 +216,7 @@
     const today = fmt(new Date(), "yyMMdd");
     const used = (id) => imageUrls.has(imageName(id)) || allOrders().some((o) => o.controlNo === id);
     for (let i = 0; i < 50; i++) {
-      let seq;
-      try { seq = check(await sb.rpc("pt_next_seq", { p_day: today })); }
-      catch (e) {
-        if (!netErr(e)) throw e;
-        // ออฟไลน์: ใช้เลขชุด 9xxx ของเครื่องนี้ ไม่ชนกับเลขที่ออกจากฐานข้อมูล
-        let n = 9001; while (used(`PT-${today}-${n}`)) n++;
-        return `PT-${today}-${n}`;
-      }
+      const seq = check(await sb.rpc("pt_next_seq", { p_day: today }));
       const id = `PT-${today}-${pad(seq, 4)}`;
       if (!used(id)) return id;
     }
@@ -403,37 +242,8 @@
     return workers[lang];
   }
 
-  // ---------- Google Vision (ผ่าน Supabase Edge Function "pt-ocr") ----------
-  const ENGINE_KEY = "pt-ocr-engine";
-  const ocrEngine = () => (lsGet(ENGINE_KEY) === "vision" ? "vision" : "local");
-  const setOcrEngine = (v) => lsSet(ENGINE_KEY, v === "vision" ? "vision" : "local");
-  const visionMemo = new WeakMap();   // ภาพเดิมอ่านครั้งเดียว (ไม่เสียค่าใช้จ่ายซ้ำ)
-  const blobToB64 = (b) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
-  function visionRead(blob) {
-    if (!visionMemo.has(blob)) {
-      visionMemo.set(blob, (async () => {
-        const { data, error } = await sb.functions.invoke("pt-ocr", { body: { image: await blobToB64(blob) } });
-        if (error) {
-          let msg = error.message;
-          try { msg = (await error.context.json()).error || msg; } catch { /* */ }
-          throw new Error(msg === "not-configured" ? "ยังไม่ได้ตั้ง GOOGLE_VISION_API_KEY ใน Supabase" : msg);
-        }
-        return { text: data.text || "", lines: data.lines || [], width: data.width || 0, height: data.height || 0 };
-      })().catch((e) => { visionMemo.delete(blob); throw e; }));
-    }
-    return visionMemo.get(blob);
-  }
-
-  /** อ่านภาพ 1 ครั้ง ได้ข้อความ + บรรทัดพร้อมตำแหน่ง (ใช้ Google Vision ถ้าเลือกไว้ ถ้าใช้ไม่ได้กลับมาอ่านในเครื่อง) */
-  async function ocrRead(blob, psm = 3, lang = null, whitelist = null) {
-    if (ocrEngine() === "vision") {
-      try { return await visionRead(blob); }
-      catch (e) { notice("Google Vision ใช้ไม่ได้ (" + e.message + ") อ่านในเครื่องแทน"); }
-    }
-    return tesseractRead(blob, psm, lang, whitelist);
-  }
-
-  function tesseractRead(blob, psm = 3, lang = null, whitelist = null) {
+  /** อ่านภาพ 1 ครั้ง ได้ข้อความ + บรรทัดพร้อมตำแหน่ง */
+  function ocrRead(blob, psm = 3, lang = null, whitelist = null) {
     const run = ocrLock.then(async () => {
       const w = await getWorker(lang || "tha+eng");
       await w.setParameters({
@@ -761,8 +571,7 @@
     if (dup) throw new HttpError(409, dup);
     const copy = { ...o };
     apply(copy, body);
-    try { await putOrder(copy, { checkVersion: true }); }
-    catch (e) { if (e.conflict) throw new HttpError(409, e.message); throw e; }
+    await putOrder(copy);
     return json(copy);
   });
 
@@ -1014,7 +823,6 @@
     const data = { app: "ParcelTrack", format: 1, version: VERSION, exportedAt: nowIso(),
       orders: allOrders(), withdrawals: sortedWithdrawals(), counter: (await getMeta("control-counter")) || null, images };
     saveBlob(new Blob([JSON.stringify(data)], { type: "application/json" }), `ParcelTrack-backup-${stamp()}.json`);
-    lsSet("pt-last-backup", String(Date.now()));
     return { orders: data.orders.length, images: Object.keys(images).length };
   }
 
@@ -1086,8 +894,7 @@
 
   async function storageInfo() {
     await ready;
-    return { email: userEmail, orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size,
-      pending: outbox.length, offline, lastBackup: Number(lsGet("pt-last-backup")) || null };
+    return { email: userEmail, orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size };
   }
   async function signOut() {
     uid = null;
@@ -1101,18 +908,9 @@
   // รูปที่ไม่มีในเครื่องนี้ แสดงเป็นกรอบว่างแทนรูปเสีย
   const MISSING = "data:image/svg+xml;charset=utf-8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="100%" height="100%" fill="#ECE9E3"/><text x="50%" y="50%" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#5B6169">ไม่มีรูปในเครื่องนี้</text></svg>');
 
-  // เตือนให้ดาวน์โหลดไฟล์สำรอง (รวมรูป) ถ้าไม่ได้สำรองเกิน 14 วัน วันละครั้ง
-  function backupReminder() {
-    if (!orders.size) return;
-    const last = Number(lsGet("pt-last-backup")) || 0, nagged = Number(lsGet("pt-backup-nag")) || 0;
-    if (Date.now() - last < 14 * 86400000 || Date.now() - nagged < 86400000) return;
-    lsSet("pt-backup-nag", String(Date.now()));
-    notice(last ? "ไม่ได้ดาวน์โหลดไฟล์สำรองมาเกิน 14 วัน ไปที่เมนู มือถือ & สำรองข้อมูล" : "ยังไม่เคยดาวน์โหลดไฟล์สำรอง ไปที่เมนู มือถือ & สำรองข้อมูล", false);
-  }
-
   window.PTBackend = {
     ready, version: VERSION,
     imgUrl: (name) => imageUrls.get(name) || MISSING,
-    exportBackup, importFiles, storageInfo, signOut, pairLink, flush, ocrEngine, setOcrEngine, reload: async () => { await ready; await flush(); await loadAll(); },
+    exportBackup, importFiles, storageInfo, signOut, pairLink, reload: async () => { await ready; await loadAll(); },
   };
 })();

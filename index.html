@@ -8,9 +8,9 @@
   <meta name="apple-mobile-web-app-title" content="ParcelTrack">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="apple-touch-icon" href="icon.svg">
   <title>ParcelTrack</title>
-  <link rel="stylesheet" href="app.css?v=web-1.18.0">
+  <link rel="stylesheet" href="app.css?v=web-1.17.1">
 </head>
 <body>
   <div class="shell">
@@ -55,15 +55,14 @@
   <script src="vendor/qrcode.js"></script>
   <script src="vendor/tesseract/tesseract.min.js"></script>
   <script src="vendor/supabase.js"></script>
-  <script src="config.js?v=web-1.18.0"></script>
-  <script src="parser.js?v=web-1.18.0"></script>
-  <script src="backend.js?v=web-1.18.0"></script>
-  <script src="app.js?v=web-1.18.0"></script>
+  <script src="config.js?v=web-1.17.1"></script>
+  <script src="parser.js?v=web-1.17.1"></script>
+  <script src="backend.js?v=web-1.17.1"></script>
+  <script src="app.js?v=web-1.17.1"></script>
   <script>
-    // ติดตั้งเป็นแอป + เปิดได้ตอนออฟไลน์ (ใช้ได้เฉพาะ https หรือ localhost)
-    if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
-      navigator.serviceWorker.register("sw.js").catch(() => {});
-    }
+    // ยกเลิกโหมดออฟไลน์ที่เคยติดตั้งไว้ (ถ้ามี) ให้เครื่องโหลดไฟล์ใหม่จากเว็บทุกครั้ง
+    navigator.serviceWorker?.getRegistrations?.().then((rs) => rs.forEach((r) => r.unregister())).catch(() => {});
+    window.caches?.keys?.().then((ks) => ks.filter((k) => k.startsWith("pt-web-")).forEach((k) => caches.delete(k))).catch(() => {});
   </script>
 </body>
 </html>
