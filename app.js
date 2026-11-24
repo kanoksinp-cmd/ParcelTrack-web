@@ -1171,7 +1171,7 @@
     });
   }
 
-  // รูปเก็บอยู่ในเบราว์เซอร์ (IndexedDB) ได้ลิงก์ blob: ของรูปล่าสุดเสมอ ไม่ต้องใช้ ?v= กันแคช
+  // รูปเก็บอยู่ใน Supabase Storage: ได้ลิงก์ (signed URL / blob:) ของรูปล่าสุดเสมอ ไม่ต้องใช้ ?v= กันแคช
   const imgUrl = (name) => window.PTBackend.imgUrl(name);
 
   async function editOrder(id) {
@@ -1836,49 +1836,56 @@
     });
   }
 
-  // ---------- มือถือ & สำรองข้อมูล (เวอร์ชันเว็บ: ข้อมูลอยู่ในเบราว์เซอร์ของแต่ละเครื่อง) ----------
+  // ---------- มือถือ & สำรองข้อมูล (ข้อมูลอยู่บน Supabase ใช้ร่วมกันทุกเครื่องที่ล็อกอินบัญชีเดียวกัน) ----------
   async function phone() {
     const info = await window.PTBackend.storageInfo();
-    const site = location.href.split("#")[0];
-    const online = /^https?:$/.test(location.protocol) && !/^(localhost|127\.)/.test(location.hostname);
+    const pair = window.PTBackend.pairLink();
     const qr = (text) => {
       const q = qrcode(0, "M"); q.addData(text); q.make();
       return q.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
     };
-    const mb = (n) => (n == null ? "–" : (n / 1048576).toFixed(1) + " MB");
 
     $view.innerHTML = `
       <div class="page-head"><div><h1>มือถือ &amp; สำรองข้อมูล</h1>
-        <p>ข้อมูลเก็บอยู่ในเบราว์เซอร์ของเครื่องนี้เท่านั้น มือถือกับคอมจึงมีข้อมูลแยกกัน ย้ายข้อมูลได้ด้วยไฟล์สำรอง</p></div></div>
+        <p>ข้อมูลเก็บบน Supabase มือถือกับคอมที่เชื่อมแล้วเห็นข้อมูลชุดเดียวกัน ไม่ต้องล็อกอิน</p></div></div>
       <div class="phone-grid">
         <div class="stack">
-          ${online ? `
+          ${pair ? `
           <div class="card qr-card secure">
-            <div class="qr-tag green">เปิดบนมือถือ</div>
-            <div class="qr">${qr(site)}</div>
-            <div class="qr-url">${esc(site)}</div>
-            <p class="qr-note">ส่องด้วยกล้องมือถือเพื่อเปิดเว็บนี้ เป็น https จึงเปิดกล้องสดยิง QR ได้เลย
-              (กด แชร์ &gt; "เพิ่มไปยังหน้าจอโฮม" เพื่อใช้แบบแอป)</p>
-          </div>` : `
-          <div class="card tips"><b>ยังไม่ได้เปิดผ่านเว็บไซต์</b><br>
-            ตอนนี้เปิดจากไฟล์ในเครื่อง ถ้าอยากใช้บนมือถือ ให้เปิด GitHub Pages ของ repo นี้
-            (ดูวิธีใน README.md) แล้วกลับมาหน้านี้จะมี QR Code ให้ส่อง</div>`}
-          <div class="card">
-            <h2 style="margin-top:0">ข้อมูลในเครื่องนี้</h2>
+            <div class="qr-tag green">เชื่อมมือถือ / เครื่องอื่น</div>
+            <div class="qr" id="pairQr"><button class="btn block" id="showPair">แสดง QR เชื่อมเครื่อง</button></div>
+            <p class="qr-note">ส่อง QR นี้ด้วยกล้องมือถือครั้งเดียว มือถือจะเปิดเว็บและเชื่อมต่อให้เอง ไม่ต้องล็อกอิน
+              (กด แชร์ &gt; "เพิ่มไปยังหน้าจอโฮม" เพื่อใช้แบบแอป)<br>
+              <b>QR / ลิงก์นี้เปรียบเหมือนกุญแจ อย่าส่งให้คนอื่น</b></p>
+          </div>` : ""}
+          <div class="card" style="padding:18px 20px">
+            <h2 style="margin:0 0 8px;font-size:18px">ข้อมูลบน Supabase</h2>
             <p>คำสั่งซื้อ <b>${info.orders}</b> รายการ · ยอดเบิก <b>${info.withdrawals}</b> รายการ · รูป <b>${info.images}</b> รูป<br>
-              ใช้พื้นที่ ${mb(info.usage)}${info.quota ? ` จาก ${mb(info.quota)}` : ""}
-              ${info.persisted ? " · เบราว์เซอร์ล็อกข้อมูลไว้ไม่ให้ลบเอง" : ""}</p>
+              ${info.offline ? '<b style="color:#B42318">ออฟไลน์</b> · ' : ""}${info.pending ? `<b style="color:#B54708">รอส่งขึ้น ${info.pending} งาน</b>` : "ข้อมูลตรงกับ Supabase แล้ว"}<br>
+              สำรองล่าสุด: ${info.lastBackup ? dt(new Date(info.lastBackup)) : "ยังไม่เคย"}</p>
+            <div class="row" style="display:flex;gap:10px;margin-top:10px">
+              <button class="btn" id="acRefresh" style="flex:1">ดึงข้อมูลล่าสุด</button>
+              <button class="btn" id="acOut" style="flex:1">เลิกเชื่อมเครื่องนี้</button>
+            </div>
           </div>
         </div>
         <div class="stack">
-          <div class="card">
-            <h2 style="margin-top:0">สำรองข้อมูล</h2>
-            <p>ดาวน์โหลดไฟล์ .json ที่มีคำสั่งซื้อ ยอดเบิก และรูปทั้งหมด เก็บไว้กันข้อมูลหาย
-              หรือนำไปเปิดที่เครื่องอื่น (กด "นำเข้า" ที่เครื่องปลายทาง)</p>
+          <div class="card" style="padding:18px 20px">
+            <h2 style="margin:0 0 8px;font-size:18px">ตัวอ่านภาพ (OCR)</h2>
+            <p>ในเครื่อง (ฟรี) ใช้ได้เสมอ · Google Vision อ่านภาษาไทยแม่นกว่า มีค่าใช้จ่ายหลังเกิน 1,000 ภาพ/เดือน
+              (ต้องตั้ง API key ก่อน ดู README) ถ้า Google Vision ใช้ไม่ได้ จะกลับไปอ่านในเครื่องให้เอง</p>
+            <select id="ocrEngine" style="width:100%;padding:10px;border-radius:12px;border:1px solid var(--line);font:inherit;margin-top:8px">
+              <option value="local">อ่านในเครื่อง (Tesseract)</option>
+              <option value="vision">Google Vision (แม่นกว่า)</option>
+            </select>
+          </div>
+          <div class="card" style="padding:18px 20px">
+            <h2 style="margin:0 0 8px;font-size:18px">สำรองข้อมูล</h2>
+            <p>ดาวน์โหลดไฟล์ .json ที่มีคำสั่งซื้อ ยอดเบิก และรูปทั้งหมด เก็บไว้เป็นสำเนาสำรองนอก Supabase</p>
             <button class="btn primary block" id="bkExport">${I.upload}ดาวน์โหลดไฟล์สำรอง</button>
           </div>
-          <div class="card">
-            <h2 style="margin-top:0">นำเข้าข้อมูล</h2>
+          <div class="card" style="padding:18px 20px">
+            <h2 style="margin:0 0 8px;font-size:18px">นำเข้าข้อมูล</h2>
             <p>เลือกไฟล์สำรอง (.json) จากเครื่องอื่น หรือย้ายข้อมูลจาก<b>โปรแกรม ParcelTrack บนคอมแบบเดิม</b>:
               เลือก <code>orders.json</code>, <code>withdrawals.json</code>, <code>control-counter.json</code>
               ในโฟลเดอร์ <code>C:\\ParcelTrack\\data</code> และรูป .jpg ทั้งหมดใน <code>data\\uploads</code> พร้อมกันได้เลย
@@ -1889,9 +1896,24 @@
         </div>
       </div>
       <div class="card tips"><b>ควรรู้</b><br>
-        • ข้อมูลอยู่ในเบราว์เซอร์ ถ้าล้างประวัติ/ข้อมูลเว็บไซต์ หรือใช้โหมดไม่ระบุตัวตน ข้อมูลจะหาย ควรสำรองไว้เป็นระยะ<br>
-        • การอ่านภาพครั้งแรกจะโหลดตัวอ่านภาพประมาณ 10 MB หลังจากนั้นเร็วขึ้น<br>
-        • เว็บนี้ไม่ส่งข้อมูลคำสั่งซื้อออกไปที่ไหน ทุกอย่างทำในเครื่องนี้</div>`;
+        • เฉพาะเครื่องที่เชื่อมแล้วเท่านั้นที่อ่าน/แก้ข้อมูลได้ คนที่รู้แค่ลิงก์เว็บเปิดข้อมูลไม่ได้<br>
+        • อีกเครื่องเพิ่มรายการใหม่ กลับมาที่หน้านี้หรือกด "ดึงข้อมูลล่าสุด" จะเห็นทันที<br>
+        • การอ่านภาพทำในเครื่องนี้ ครั้งแรกจะโหลดตัวอ่านภาพประมาณ 10 MB หลังจากนั้นเร็วขึ้น<br>
+        • Supabase แพ็กเกจฟรีจะหยุด project ถ้าไม่มีการใช้งาน 7 วัน ให้เข้าไปกด Restore ที่ supabase.com</div>`;
+
+    $view.querySelector("#acOut").addEventListener("click", () => {
+      if (confirm("เลิกเชื่อมเครื่องนี้? ข้อมูลบน Supabase ไม่หาย แต่ต้องเปิดลิงก์เชื่อมเครื่องใหม่ถึงจะใช้ได้อีก")) window.PTBackend.signOut();
+    });
+    const $eng = $view.querySelector("#ocrEngine");
+    $eng.value = window.PTBackend.ocrEngine();
+    $eng.addEventListener("change", () => { window.PTBackend.setOcrEngine($eng.value); toast("เปลี่ยนตัวอ่านภาพแล้ว"); });
+    $view.querySelector("#showPair")?.addEventListener("click", () => {
+      $view.querySelector("#pairQr").innerHTML = qr(pair);
+    });
+    $view.querySelector("#acRefresh").addEventListener("click", async () => {
+      try { await window.PTBackend.reload(); toast("ดึงข้อมูลล่าสุดแล้ว"); phone(); }
+      catch (err) { toast(err?.message || String(err), true); }
+    });
 
     $view.querySelector("#bkExport").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
@@ -1912,7 +1934,7 @@
       try {
         const r = await window.PTBackend.importFiles(list);
         busy.close();
-        toast(`นำเข้าแล้ว: คำสั่งซื้อ ${r.orders} · ยอดเบิก ${r.withdrawals} · รูป ${r.images}${r.skipped ? ` (ข้าม ${r.skipped} ไฟล์ที่ไม่รู้จัก)` : ""}`);
+        toast(`นำเข้าแล้ว: คำสั่งซื้อ ${r.orders} · ยอดเบิก ${r.withdrawals} · รูป ${r.images}${r.duplicates ? ` · ข้ามรายการซ้ำ ${r.duplicates}` : ""}${r.skipped ? ` · ข้ามไฟล์ที่ไม่รู้จัก ${r.skipped}` : ""}`);
         phone();
       } catch (err) {
         busy.close();

@@ -1,0 +1,18 @@
+# ย้ายไฟล์นี้ไปไว้ที่ .github/workflows/test.yml เพื่อเปิดการทดสอบอัตโนมัติบน GitHub (ดู README)
+# ทดสอบอัตโนมัติทุกครั้งที่ push: ตรวจว่าไฟล์ JavaScript ไม่มี syntax ผิด และตัวแยกข้อความ OCR ยังอ่านได้ถูก
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax check
+        run: for f in app.js backend.js parser.js config.js sw.js; do node --check "$f"; done
+      - name: Parser tests
+        run: node --test tests/*.test.mjs

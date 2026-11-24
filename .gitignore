@@ -1,5 +1,8 @@
 data/
 ParcelTrack-backup-*.json
+ParcelTrack-db-*.json
+*pairing-link*
+cloud-backup/
 *.xlsx
 *.zip
 .DS_Store

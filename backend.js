@@ -1,6 +1,8 @@
-/* ParcelTrack (เวอร์ชันเว็บล้วน) — แทนที่โปรแกรมฝั่งคอม (ASP.NET) ด้วยโค้ดที่รันในเบราว์เซอร์
+/* ParcelTrack (เวอร์ชันเว็บ) — แทนที่โปรแกรมฝั่งคอม (ASP.NET) ด้วยโค้ดที่รันในเบราว์เซอร์
  *
- * - ข้อมูลเก็บใน IndexedDB ของเบราว์เซอร์ (แต่ละเครื่อง/เบราว์เซอร์มีข้อมูลของตัวเอง)
+ * - ข้อมูลเก็บใน Supabase (ตาราง pt_orders / pt_withdrawals / pt_meta + bucket "parceltrack")
+ *   ไม่ต้องล็อกอิน: เปิด "ลิงก์เชื่อมเครื่อง" ครั้งเดียวต่อเครื่อง ใช้ข้อมูลชุดเดียวกันทุกเครื่อง
+ *   คนที่ไม่มีลิงก์เชื่อมเครื่องอ่าน/แก้ข้อมูลไม่ได้ (Row Level Security เฉพาะบัญชีเจ้าของ)
  * - อ่านภาพด้วย Tesseract.js (OCR ในเบราว์เซอร์ ใช้ไฟล์ภาษาไทยใน tessdata/)
  * - ดัก fetch("/api/...") และ fetch("/uploads/...") ของ app.js แล้วตอบจากในเครื่อง
  *   app.js จึงแทบไม่ต้องแก้ ทำงานเหมือนตอนต่อกับโปรแกรมบนคอม
@@ -8,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "web-1.16.0";
+  const VERSION = "web-1.18.0";
   const P = window.PTParser;
   const CONTROL_RX = /^PT-\d{6}-\d{4}$/;
   const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"];
@@ -38,98 +40,348 @@
   const newId = () => (crypto.randomUUID ? crypto.randomUUID()
     : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
 
-  // ---------- IndexedDB ----------
-  let db;
+  // ---------- Supabase (ฐานข้อมูล + ที่เก็บรูป + ล็อกอิน) ----------
+  const cfg = window.PT_CONFIG || {};
+  if (!window.supabase || !cfg.supabaseUrl) throw new Error("โหลด Supabase ไม่สำเร็จ ตรวจ config.js");
+  const sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+  });
+  const BUCKET = cfg.bucket || "parceltrack";
+  let uid = null, userEmail = null;
+
   const orders = new Map();       // id -> order
   const withdrawals = new Map();  // id -> withdrawal
-  const imageUrls = new Map();    // ชื่อไฟล์ -> blob: URL (ใช้กับ <img src>)
+  const imageUrls = new Map();    // ชื่อไฟล์ -> URL ที่ใช้กับ <img src> (signed URL หรือ blob:)
+  const localBlobs = new Map();   // รูปที่เพิ่งอัปโหลดจากเครื่องนี้ (ไม่ต้องดาวน์โหลดซ้ำ)
 
-  function openDb() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open("parceltrack", 1);
-      req.onupgradeneeded = () => {
-        const d = req.result;
-        d.createObjectStore("orders", { keyPath: "id" });
-        d.createObjectStore("withdrawals", { keyPath: "id" });
-        d.createObjectStore("images");
-        d.createObjectStore("meta");
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+  // ข้อผิดพลาดจากเน็ตหลุด (ใช้ตัดสินว่าจะเก็บงานไว้ส่งทีหลังหรือไม่)
+  const isNetMsg = (m) => /failed to fetch|networkerror|network request failed|load failed|fetch failed|timeout|ERR_INTERNET|ERR_NETWORK/i.test(String(m || ""));
+  function check({ data, error }) {
+    if (error) {
+      const e = new Error("ติดต่อฐานข้อมูลไม่สำเร็จ: " + (error.message || error));
+      e.net = !navigator.onLine || isNetMsg(error.message) || isNetMsg(error.name) || error.status === 0;
+      throw e;
+    }
+    return data;
+  }
+  const netErr = (e) => !!(e && (e.net || !navigator.onLine || isNetMsg(e.message) || e.name === "TypeError"));
+
+  // ---------- ที่เก็บในเครื่อง (IndexedDB): สำเนาข้อมูลล่าสุด + คิวงานตอนออฟไลน์ ----------
+  const local = (() => {
+    let dbp;
+    const open = () => dbp ||= new Promise((res, rej) => {
+      const r = indexedDB.open("parceltrack-cache", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("kv");
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
     });
-  }
-  function tx(store, mode, fn) {
-    return new Promise((resolve, reject) => {
-      const t = db.transaction(store, mode);
-      const s = t.objectStore(store);
-      let result;
-      Promise.resolve(fn(s)).then((r) => { result = r; });
-      t.oncomplete = () => resolve(result);
-      t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error || new Error("บันทึกข้อมูลในเบราว์เซอร์ไม่สำเร็จ (พื้นที่เต็ม?)"));
-    });
-  }
-  const reqP = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-
-  async function loadAll() {
-    const [os, ws] = await Promise.all([
-      tx("orders", "readonly", (s) => reqP(s.getAll())),
-      tx("withdrawals", "readonly", (s) => reqP(s.getAll())),
-    ]);
-    os.forEach((o) => orders.set(o.id, o));
-    ws.forEach((w) => withdrawals.set(w.id, w));
-    await new Promise((resolve, reject) => {
-      const t = db.transaction("images", "readonly");
-      const cur = t.objectStore("images").openCursor();
-      cur.onsuccess = () => {
-        const c = cur.result;
-        if (!c) return;
-        imageUrls.set(c.key, URL.createObjectURL(c.value));
-        c.continue();
-      };
-      t.oncomplete = resolve;
-      t.onerror = () => reject(t.error);
-    });
-  }
-
-  const putOrder = (o) => tx("orders", "readwrite", (s) => s.put(o)).then(() => orders.set(o.id, o));
-  const delOrder = (id) => tx("orders", "readwrite", (s) => s.delete(id)).then(() => orders.delete(id));
-  const putWithdrawal = (w) => tx("withdrawals", "readwrite", (s) => s.put(w)).then(() => withdrawals.set(w.id, w));
-  const delWithdrawal = (id) => tx("withdrawals", "readwrite", (s) => s.delete(id)).then(() => withdrawals.delete(id));
-  const getMeta = (k) => tx("meta", "readonly", (s) => reqP(s.get(k)));
-  const setMeta = (k, v) => tx("meta", "readwrite", (s) => s.put(v, k));
-  const getImage = (name) => tx("images", "readonly", (s) => reqP(s.get(name)));
-  async function putImage(name, blob) {
-    await tx("images", "readwrite", (s) => s.put(blob, name));
-    if (imageUrls.has(name)) URL.revokeObjectURL(imageUrls.get(name));
-    imageUrls.set(name, URL.createObjectURL(blob));
-  }
-  async function deleteImage(name) {
-    await tx("images", "readwrite", (s) => s.delete(name));
-    if (imageUrls.has(name)) { URL.revokeObjectURL(imageUrls.get(name)); imageUrls.delete(name); }
-  }
-
-  const ready = (async () => {
-    db = await openDb();
-    await loadAll();
-    try { await navigator.storage?.persist?.(); } catch { /* ไม่เป็นไร */ }
+    const run = async (mode, fn) => {
+      const db = await open();
+      return new Promise((res, rej) => {
+        const t = db.transaction("kv", mode), q = fn(t.objectStore("kv"));
+        t.oncomplete = () => res(q?.result);
+        t.onerror = () => rej(t.error);
+      });
+    };
+    return {
+      get: (k) => run("readonly", (s) => s.get(k)).catch(() => undefined),
+      set: (k, v) => run("readwrite", (s) => s.put(v, k)).catch(() => {}),
+    };
   })();
 
-  // ---------- เลข ID No. (PT-ปปดดวว-ลำดับ เริ่มใหม่ทุกวัน) ----------
+  const versions = new Map();     // id -> updated_at ล่าสุดที่เครื่องนี้รู้ (ใช้ตรวจการแก้ชนกันข้ามเครื่อง)
+  let offline = false;            // โหลดจากสำเนาในเครื่อง เพราะติดต่อ Supabase ไม่ได้
+  let outbox = [];                // งานที่รอส่งขึ้น Supabase
+
+  async function selectAll(table) {
+    const out = [];
+    for (let from = 0; ; from += 1000) {
+      const rows = check(await sb.from(table).select("id, data, updated_at").order("id").range(from, from + 999));
+      out.push(...rows);
+      if (rows.length < 1000) break;
+    }
+    return out;
+  }
+
+  const SIGN_TTL = 60 * 60 * 24 * 7;   // ลิงก์รูปอายุ 7 วัน
+  let signedAt = 0;
+  async function loadImages() {
+    const names = [];
+    for (let offset = 0; ; offset += 1000) {
+      const items = check(await sb.storage.from(BUCKET).list(uid, { limit: 1000, offset, sortBy: { column: "name", order: "asc" } }));
+      names.push(...items.filter((i) => i.id && !i.name.startsWith(".")).map((i) => i.name));
+      if (items.length < 1000) break;
+    }
+    // ลิงก์ใกล้หมดอายุ (เกิน 5 วัน) ขอใหม่ทั้งหมด รูปจะได้ไม่หายถ้าเปิดค้างไว้นาน
+    const renew = Date.now() - signedAt > 5 * 86400000;
+    const keep = new Set(names);
+    for (const [n, u] of [...imageUrls]) {
+      if (u.startsWith("blob:")) { if (!keep.has(n) && !localBlobs.has(n)) imageUrls.delete(n); continue; }
+      if (!keep.has(n) || renew) imageUrls.delete(n);
+    }
+    const missing = names.filter((n) => !imageUrls.has(n));
+    for (let i = 0; i < missing.length; i += 200) {
+      const chunk = missing.slice(i, i + 200);
+      const signed = check(await sb.storage.from(BUCKET).createSignedUrls(chunk.map((n) => `${uid}/${n}`), SIGN_TTL));
+      signed.forEach((s, j) => { if (s.signedUrl) imageUrls.set(chunk[j], s.signedUrl); });
+    }
+    if (renew || missing.length) signedAt = Date.now();
+  }
+
+  const snapKey = () => "snapshot:" + uid;
+  const saveSnapshot = () => local.set(snapKey(), {
+    at: Date.now(), orders: [...orders.values()], withdrawals: [...withdrawals.values()], versions: [...versions],
+  });
+
+  let lastLoad = 0;
+  async function loadAll() {
+    try {
+      const [os, ws] = await Promise.all([selectAll("pt_orders"), selectAll("pt_withdrawals")]);
+      orders.clear(); withdrawals.clear(); versions.clear();
+      os.forEach((r) => { orders.set(r.id, r.data); versions.set(r.id, r.updated_at); });
+      ws.forEach((r) => { withdrawals.set(r.id, r.data); versions.set(r.id, r.updated_at); });
+      // งานที่ยังค้างในคิว ทับข้อมูลที่โหลดมา (เครื่องนี้แก้ไว้ล่าสุด)
+      for (const job of outbox) applyLocal(job);
+      await loadImages();
+      offline = false;
+      lastLoad = Date.now();
+      saveSnapshot();
+    } catch (e) {
+      if (!netErr(e)) throw e;
+      const snap = await local.get(snapKey());
+      if (!snap) throw new Error("ไม่มีอินเทอร์เน็ต และเครื่องนี้ยังไม่เคยโหลดข้อมูลไว้");
+      orders.clear(); withdrawals.clear(); versions.clear();
+      snap.orders.forEach((o) => orders.set(o.id, o));
+      snap.withdrawals.forEach((w) => withdrawals.set(w.id, w));
+      (snap.versions || []).forEach(([k, v]) => versions.set(k, v));
+      for (const job of outbox) applyLocal(job);
+      offline = true;
+      notice("ออฟไลน์: ใช้ข้อมูลที่โหลดไว้ล่าสุด งานใหม่จะถูกส่งขึ้นเมื่อมีอินเทอร์เน็ต");
+    }
+  }
+
+  // ---------- เขียนข้อมูล: ส่งขึ้น Supabase ทันที ถ้าเน็ตหลุดเก็บเข้าคิวไว้ส่งทีหลัง ----------
+  const stampNow = () => new Date().toISOString();
+  const TABLE = { order: "pt_orders", withdrawal: "pt_withdrawals" };
+
+  function applyLocal(job) {
+    const map = job.kind === "withdrawal" ? withdrawals : orders;
+    if (job.op === "put") map.set(job.row.id, job.row);
+    if (job.op === "del") map.delete(job.id);
+  }
+
+  async function remotePut(kind, row, checkVersion) {
+    const table = TABLE[kind], at = stampNow(), known = versions.get(row.id);
+    if (checkVersion && known) {
+      // แก้รายการเดิม: เขียนได้เฉพาะเมื่อไม่มีเครื่องอื่นแก้ไปก่อน
+      const rows = check(await sb.from(table).update({ data: row, updated_at: at }).eq("id", row.id).eq("updated_at", known).select("updated_at"));
+      if (rows.length) { versions.set(row.id, rows[0].updated_at); return; }
+      const latest = check(await sb.from(table).select("data, updated_at").eq("id", row.id).limit(1))[0];
+      if (latest) {
+        (kind === "withdrawal" ? withdrawals : orders).set(row.id, latest.data);
+        versions.set(row.id, latest.updated_at);
+        saveSnapshot();
+        const e = new Error("รายการนี้ถูกแก้จากอีกเครื่องก่อนหน้านี้ เปิดรายการใหม่อีกครั้งเพื่อดูข้อมูลล่าสุด แล้วแก้ซ้ำ");
+        e.conflict = true;
+        throw e;
+      }
+    }
+    const rows = check(await sb.from(table).upsert({ id: row.id, data: row, updated_at: at }).select("updated_at"));
+    if (rows[0]) versions.set(row.id, rows[0].updated_at);
+  }
+  async function remoteDel(kind, id) {
+    check(await sb.from(TABLE[kind]).delete().eq("id", id));
+    versions.delete(id);
+  }
+
+  async function queue(job) {
+    outbox.push(job);
+    await local.set("outbox:" + uid, outbox);
+    notice(`ออฟไลน์: บันทึกไว้ในเครื่องแล้ว (${outbox.length} งานรอส่ง) จะส่งขึ้นเมื่อมีอินเทอร์เน็ต`);
+  }
+
+  async function write(job, checkVersion) {
+    if (!outbox.length) {
+      try {
+        if (job.op === "put") await remotePut(job.kind, job.row, checkVersion);
+        else await remoteDel(job.kind, job.id);
+        applyLocal(job); saveSnapshot();
+        return;
+      } catch (e) { if (!netErr(e)) throw e; }
+    }
+    await queue(job);          // มีงานค้างอยู่แล้ว หรือเน็ตหลุด: ต่อคิวไว้ตามลำดับ
+    applyLocal(job); saveSnapshot();
+  }
+
+  const putOrder = (o, opts = {}) => write({ op: "put", kind: "order", row: o }, opts.checkVersion);
+  const delOrder = (id) => write({ op: "del", kind: "order", id });
+  const putWithdrawal = (w) => write({ op: "put", kind: "withdrawal", row: w });
+  const delWithdrawal = (id) => write({ op: "del", kind: "withdrawal", id });
+
+  async function getMeta(k) {
+    const rows = check(await sb.from("pt_meta").select("value").eq("key", k).limit(1));
+    return rows[0]?.value ?? null;
+  }
+  async function setMeta(k, v) {
+    check(await sb.from("pt_meta").upsert({ key: k, value: v }, { onConflict: "user_id,key" }));
+  }
+  async function getImage(name) {
+    if (localBlobs.has(name)) return localBlobs.get(name);
+    const { data, error } = await sb.storage.from(BUCKET).download(`${uid}/${name}`);
+    return error ? null : data;
+  }
+  const imgType = (blob) => (/^image\/(jpeg|png|webp)$/.test(blob.type) ? blob.type : "image/jpeg");
+  function setLocalImage(name, blob) {
+    const old = imageUrls.get(name);
+    if (old?.startsWith("blob:")) URL.revokeObjectURL(old);
+    localBlobs.set(name, blob);
+    imageUrls.set(name, URL.createObjectURL(blob));
+  }
+  async function putImage(name, blob) {
+    const job = { op: "img", name, blob };
+    if (!outbox.length) {
+      try {
+        check(await sb.storage.from(BUCKET).upload(`${uid}/${name}`, blob, { upsert: true, contentType: imgType(blob), cacheControl: "60" }));
+        setLocalImage(name, blob);
+        return;
+      } catch (e) { if (!netErr(e)) throw e; }
+    }
+    await queue(job);
+    setLocalImage(name, blob);
+  }
+  async function deleteImage(name) {
+    if (!outbox.length) {
+      try { check(await sb.storage.from(BUCKET).remove([`${uid}/${name}`])); }
+      catch (e) { if (!netErr(e)) throw e; await queue({ op: "imgdel", name }); }
+    } else await queue({ op: "imgdel", name });
+    const old = imageUrls.get(name);
+    if (old?.startsWith("blob:")) URL.revokeObjectURL(old);
+    imageUrls.delete(name); localBlobs.delete(name);
+  }
+
+  // ส่งงานในคิวขึ้น Supabase ตามลำดับ (เครื่องนี้แก้ล่าสุด = ใช้ของเครื่องนี้)
+  let flushing = false;
+  async function flush() {
+    if (flushing || !outbox.length || !uid) return;
+    flushing = true;
+    try {
+      while (outbox.length) {
+        const job = outbox[0];
+        if (job.op === "put") await remotePut(job.kind, job.row, false);
+        else if (job.op === "del") await remoteDel(job.kind, job.id);
+        else if (job.op === "img") check(await sb.storage.from(BUCKET).upload(`${uid}/${job.name}`, job.blob, { upsert: true, contentType: imgType(job.blob), cacheControl: "60" }));
+        else if (job.op === "imgdel") check(await sb.storage.from(BUCKET).remove([`${uid}/${job.name}`]));
+        outbox.shift();
+        await local.set("outbox:" + uid, outbox);
+      }
+      if (offline) { offline = false; await loadAll(); }
+      saveSnapshot();
+      notice("ส่งงานที่ค้างขึ้น Supabase ครบแล้ว", false);
+    } catch (e) {
+      if (!netErr(e)) {
+        // งานที่ส่งไม่ได้ด้วยเหตุอื่น (ไม่ใช่เน็ต) ข้ามไป ไม่ให้ค้างคิวตลอดไป
+        console.error("flush", e);
+        outbox.shift(); await local.set("outbox:" + uid, outbox);
+        notice("ส่งงานที่ค้างบางรายการไม่สำเร็จ: " + e.message);
+        flushing = false; return flush();
+      }
+    } finally { flushing = false; }
+  }
+  window.addEventListener("online", () => flush());
+  setInterval(() => { if (outbox.length && navigator.onLine) flush(); }, 60000);
+
+  function notice(msg, isError = true) {
+    const t = document.getElementById("toast");
+    if (!t) return;
+    t.textContent = msg; t.className = "toast show" + (isError ? " error" : "");
+    clearTimeout(notice.timer);
+    notice.timer = setTimeout(() => (t.className = "toast"), 4500);
+  }
+
+  // ---------- เชื่อมเครื่อง (ไม่ต้องล็อกอิน/ไม่ต้องใส่ PIN) ----------
+  // เปิด "ลิงก์เชื่อมเครื่อง" (…/#pair=xxxx) ครั้งเดียวต่อเครื่อง เครื่องจะจำไว้ตลอด
+  // เครื่องที่เชื่อมแล้วแสดง QR ของลิงก์นี้ในเมนู "มือถือ & สำรองข้อมูล" ให้มือถือส่องเพื่อเชื่อมต่อ
+  const PAIR_KEY = "pt-pair";
+  const pairFromHash = (() => {
+    const m = location.hash.match(/^#pair=([A-Za-z0-9_-]+)$/);
+    if (!m) return null;
+    history.replaceState(null, "", location.pathname + location.search + "#/");
+    return m[1];
+  })();
+  const decodePair = (code) => {
+    try {
+      const txt = atob(code.replace(/-/g, "+").replace(/_/g, "/"));
+      const i = txt.indexOf("\n");
+      return i > 0 ? { email: txt.slice(0, i), password: txt.slice(i + 1) } : null;
+    } catch { return null; }
+  };
+  const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* */ } };
+
+  async function signInWithPair(code) {
+    const c = code && decodePair(code);
+    if (!c) return null;
+    const { data, error } = await sb.auth.signInWithPassword(c);
+    if (error) return null;
+    lsSet(PAIR_KEY, code);
+    return data.user;
+  }
+
+  function notPairedScreen(msg) {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "position:fixed;inset:0;z-index:9999;background:var(--ground,#F3F1EC);display:grid;place-items:center;padding:20px";
+    wrap.innerHTML = `<div style="width:min(420px,100%);background:#fff;border:1px solid var(--line,#E3E0D9);border-radius:18px;padding:26px;line-height:1.6">
+      <h1 style="margin:0 0 8px;font-size:24px">ParcelTrack</h1>
+      <p style="margin:0;color:var(--muted,#5B6169)">${msg || "เครื่องนี้ยังไม่ได้เชื่อมต่อ"}<br>
+      เปิด <b>ลิงก์เชื่อมเครื่อง</b> ที่ได้รับไว้ หรือบนเครื่องที่ใช้อยู่แล้ว ไปที่เมนู <b>มือถือ &amp; สำรองข้อมูล</b>
+      แล้วใช้มือถือส่อง QR "เชื่อมเครื่องนี้"</p></div>`;
+    document.body.appendChild(wrap);
+    return new Promise(() => {});   // รอจนกว่าจะเปิดด้วยลิงก์เชื่อมเครื่อง
+  }
+
+  sb.auth.onAuthStateChange((event) => {
+    if (event === "SIGNED_OUT" && uid) location.reload();
+  });
+
+  const ready = (async () => {
+    let user = pairFromHash ? await signInWithPair(pairFromHash) : null;
+    if (!user) { const { data: { session } } = await sb.auth.getSession(); user = session?.user || null; }
+    if (!user) user = await signInWithPair(lsGet(PAIR_KEY));
+    if (!user) user = await notPairedScreen(pairFromHash ? "ลิงก์เชื่อมเครื่องไม่ถูกต้อง หรือเชื่อมต่อไม่ได้" : null);
+    uid = user.id; userEmail = user.email;
+    outbox = (await local.get("outbox:" + uid)) || [];
+    await loadAll();
+    if (outbox.length && navigator.onLine) flush();
+    setTimeout(backupReminder, 4000);
+  })();
+
+  // กลับมาที่หน้าเว็บ (เช่น สลับแอปบนมือถือ) ดึงข้อมูลล่าสุดจากอีกเครื่อง แล้ววาดหน้ารายการใหม่
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState !== "visible" || !uid || Date.now() - lastLoad < 20000) return;
+    try {
+      await ready; await flush(); await loadAll();
+      if (/^#?\/?(orders|report)?$/.test(location.hash)) window.dispatchEvent(new HashChangeEvent("hashchange"));
+    } catch { /* ออฟไลน์ชั่วคราว */ }
+  });
+
+  // ---------- เลข ID No. (PT-ปปดดวว-ลำดับ เริ่มใหม่ทุกวัน ออกเลขที่ฐานข้อมูล ไม่ชนกันข้ามเครื่อง) ----------
   const imageName = (id) => id + ".jpg";
-  let idLock = Promise.resolve();
-  function nextControlNo() {
-    const run = idLock.then(async () => {
-      const today = fmt(new Date(), "yyMMdd");
-      const c = (await getMeta("control-counter")) || { date: today, seq: 0 };
-      let seq = c.date === today ? c.seq : 0;
-      let id;
-      do { seq++; id = `PT-${today}-${pad(seq, 4)}`; } while (imageUrls.has(imageName(id)));
-      await setMeta("control-counter", { date: today, seq });
-      return id;
-    });
-    idLock = run.catch(() => {});
-    return run;
+  async function nextControlNo() {
+    const today = fmt(new Date(), "yyMMdd");
+    const used = (id) => imageUrls.has(imageName(id)) || allOrders().some((o) => o.controlNo === id);
+    for (let i = 0; i < 50; i++) {
+      let seq;
+      try { seq = check(await sb.rpc("pt_next_seq", { p_day: today })); }
+      catch (e) {
+        if (!netErr(e)) throw e;
+        // ออฟไลน์: ใช้เลขชุด 9xxx ของเครื่องนี้ ไม่ชนกับเลขที่ออกจากฐานข้อมูล
+        let n = 9001; while (used(`PT-${today}-${n}`)) n++;
+        return `PT-${today}-${n}`;
+      }
+      const id = `PT-${today}-${pad(seq, 4)}`;
+      if (!used(id)) return id;
+    }
+    throw new Error("ออกเลข ID No. ไม่สำเร็จ");
   }
 
   // ---------- OCR ด้วย Tesseract.js ----------
@@ -151,8 +403,37 @@
     return workers[lang];
   }
 
-  /** อ่านภาพ 1 ครั้ง ได้ข้อความ + บรรทัดพร้อมตำแหน่ง */
-  function ocrRead(blob, psm = 3, lang = null, whitelist = null) {
+  // ---------- Google Vision (ผ่าน Supabase Edge Function "pt-ocr") ----------
+  const ENGINE_KEY = "pt-ocr-engine";
+  const ocrEngine = () => (lsGet(ENGINE_KEY) === "vision" ? "vision" : "local");
+  const setOcrEngine = (v) => lsSet(ENGINE_KEY, v === "vision" ? "vision" : "local");
+  const visionMemo = new WeakMap();   // ภาพเดิมอ่านครั้งเดียว (ไม่เสียค่าใช้จ่ายซ้ำ)
+  const blobToB64 = (b) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
+  function visionRead(blob) {
+    if (!visionMemo.has(blob)) {
+      visionMemo.set(blob, (async () => {
+        const { data, error } = await sb.functions.invoke("pt-ocr", { body: { image: await blobToB64(blob) } });
+        if (error) {
+          let msg = error.message;
+          try { msg = (await error.context.json()).error || msg; } catch { /* */ }
+          throw new Error(msg === "not-configured" ? "ยังไม่ได้ตั้ง GOOGLE_VISION_API_KEY ใน Supabase" : msg);
+        }
+        return { text: data.text || "", lines: data.lines || [], width: data.width || 0, height: data.height || 0 };
+      })().catch((e) => { visionMemo.delete(blob); throw e; }));
+    }
+    return visionMemo.get(blob);
+  }
+
+  /** อ่านภาพ 1 ครั้ง ได้ข้อความ + บรรทัดพร้อมตำแหน่ง (ใช้ Google Vision ถ้าเลือกไว้ ถ้าใช้ไม่ได้กลับมาอ่านในเครื่อง) */
+  async function ocrRead(blob, psm = 3, lang = null, whitelist = null) {
+    if (ocrEngine() === "vision") {
+      try { return await visionRead(blob); }
+      catch (e) { notice("Google Vision ใช้ไม่ได้ (" + e.message + ") อ่านในเครื่องแทน"); }
+    }
+    return tesseractRead(blob, psm, lang, whitelist);
+  }
+
+  function tesseractRead(blob, psm = 3, lang = null, whitelist = null) {
     const run = ocrLock.then(async () => {
       const w = await getWorker(lang || "tha+eng");
       await w.setParameters({
@@ -480,7 +761,8 @@
     if (dup) throw new HttpError(409, dup);
     const copy = { ...o };
     apply(copy, body);
-    await putOrder(copy);
+    try { await putOrder(copy, { checkVersion: true }); }
+    catch (e) { if (e.conflict) throw new HttpError(409, e.message); throw e; }
     return json(copy);
   });
 
@@ -732,6 +1014,7 @@
     const data = { app: "ParcelTrack", format: 1, version: VERSION, exportedAt: nowIso(),
       orders: allOrders(), withdrawals: sortedWithdrawals(), counter: (await getMeta("control-counter")) || null, images };
     saveBlob(new Blob([JSON.stringify(data)], { type: "application/json" }), `ParcelTrack-backup-${stamp()}.json`);
+    lsSet("pt-last-backup", String(Date.now()));
     return { orders: data.orders.length, images: Object.keys(images).length };
   }
 
@@ -761,7 +1044,7 @@
   /** นำเข้าได้ทั้งไฟล์สำรองของเวอร์ชันเว็บ และไฟล์ของโปรแกรมเดิม (orders.json, withdrawals.json, รูป .jpg ใน data\uploads) */
   async function importFiles(fileList) {
     await ready;
-    const stat = { orders: 0, withdrawals: 0, images: 0, skipped: 0 };
+    const stat = { orders: 0, withdrawals: 0, images: 0, skipped: 0, duplicates: 0 };
     for (const f of fileList) {
       const name = f.name || "";
       if (/\.(jpe?g|png|webp)$/i.test(name) || (f.type || "").startsWith("image/")) {
@@ -784,7 +1067,14 @@
       } else if (data && "date" in data && "seq" in data) {
         await setMeta("control-counter", camel(data)); continue;
       } else { stat.skipped++; continue; }
-      for (const raw of os) { const o = cleanImportedOrder(raw); if (o) { await putOrder(o); stat.orders++; } }
+      for (const raw of os) {
+        const o = cleanImportedOrder(raw);
+        if (!o) continue;
+        // มีอยู่แล้ว (เลขพัสดุ / เลขคำสั่งซื้อ / เลขอ้างอิง ตรงกับรายการอื่น) ไม่นำเข้าซ้ำ
+        const dup = findExisting(allOrders().filter((x) => x.id !== o.id), o.trackingNumber, o.orderNumber, o.referenceNumber);
+        if (dup) { stat.duplicates++; continue; }
+        await putOrder(o); stat.orders++;
+      }
       for (const raw of ws) { const w = cleanImportedWithdrawal(raw); if (w) { await putWithdrawal(w); stat.withdrawals++; } }
       for (const [n, u] of Object.entries(imgs)) {
         if (/[\\/]|\.\./.test(n)) continue;
@@ -796,18 +1086,33 @@
 
   async function storageInfo() {
     await ready;
-    let usage = null, quota = null, persisted = null;
-    try { const e = await navigator.storage?.estimate?.(); usage = e?.usage ?? null; quota = e?.quota ?? null; } catch { /* */ }
-    try { persisted = await navigator.storage?.persisted?.(); } catch { /* */ }
-    return { orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size, usage, quota, persisted };
+    return { email: userEmail, orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size,
+      pending: outbox.length, offline, lastBackup: Number(lsGet("pt-last-backup")) || null };
   }
+  async function signOut() {
+    uid = null;
+    try { localStorage.removeItem(PAIR_KEY); } catch { /* */ }
+    await sb.auth.signOut();
+    location.reload();
+  }
+  // ลิงก์สำหรับเชื่อมเครื่องอื่น (มีเฉพาะบนเครื่องที่เชื่อมแล้ว)
+  const pairLink = () => { const c = lsGet(PAIR_KEY); return c ? location.href.split("#")[0] + "#pair=" + c : null; };
 
   // รูปที่ไม่มีในเครื่องนี้ แสดงเป็นกรอบว่างแทนรูปเสีย
   const MISSING = "data:image/svg+xml;charset=utf-8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="100%" height="100%" fill="#ECE9E3"/><text x="50%" y="50%" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#5B6169">ไม่มีรูปในเครื่องนี้</text></svg>');
 
+  // เตือนให้ดาวน์โหลดไฟล์สำรอง (รวมรูป) ถ้าไม่ได้สำรองเกิน 14 วัน วันละครั้ง
+  function backupReminder() {
+    if (!orders.size) return;
+    const last = Number(lsGet("pt-last-backup")) || 0, nagged = Number(lsGet("pt-backup-nag")) || 0;
+    if (Date.now() - last < 14 * 86400000 || Date.now() - nagged < 86400000) return;
+    lsSet("pt-backup-nag", String(Date.now()));
+    notice(last ? "ไม่ได้ดาวน์โหลดไฟล์สำรองมาเกิน 14 วัน ไปที่เมนู มือถือ & สำรองข้อมูล" : "ยังไม่เคยดาวน์โหลดไฟล์สำรอง ไปที่เมนู มือถือ & สำรองข้อมูล", false);
+  }
+
   window.PTBackend = {
     ready, version: VERSION,
     imgUrl: (name) => imageUrls.get(name) || MISSING,
-    exportBackup, importFiles, storageInfo,
+    exportBackup, importFiles, storageInfo, signOut, pairLink, flush, ocrEngine, setOcrEngine, reload: async () => { await ready; await flush(); await loadAll(); },
   };
 })();
