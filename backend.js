@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "web-1.17.1";
+  const VERSION = "web-1.17.2";
   const P = window.PTParser;
   const CONTROL_RX = /^PT-\d{6}-\d{4}$/;
   const ALLOWED_EXT = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"];
@@ -40,14 +40,14 @@
   const newId = () => (crypto.randomUUID ? crypto.randomUUID()
     : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) => (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
 
-  // ---------- Supabase (ฐานข้อมูล + ที่เก็บรูป + ล็อกอิน) ----------
+  // ---------- Supabase (ฐานข้อมูล + ที่เก็บรูป) ----------
   const cfg = window.PT_CONFIG || {};
   if (!window.supabase || !cfg.supabaseUrl) throw new Error("โหลด Supabase ไม่สำเร็จ ตรวจ config.js");
   const sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey, {
-    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
   const BUCKET = cfg.bucket || "parceltrack";
-  let uid = null, userEmail = null;
+  const uid = "shared";            // โฟลเดอร์รูปใน bucket
 
   const orders = new Map();       // id -> order
   const withdrawals = new Map();  // id -> withdrawal
@@ -125,7 +125,7 @@
     return rows[0]?.value ?? null;
   }
   async function setMeta(k, v) {
-    check(await sb.from("pt_meta").upsert({ key: k, value: v }, { onConflict: "user_id,key" }));
+    check(await sb.from("pt_meta").upsert({ key: k, value: v }, { onConflict: "key" }));
   }
   async function getImage(name) {
     if (localBlobs.has(name)) return localBlobs.get(name);
@@ -147,63 +147,14 @@
     imageUrls.delete(name); localBlobs.delete(name);
   }
 
-  // ---------- เชื่อมเครื่อง (ไม่ต้องล็อกอิน/ไม่ต้องใส่ PIN) ----------
-  // เปิด "ลิงก์เชื่อมเครื่อง" (…/#pair=xxxx) ครั้งเดียวต่อเครื่อง เครื่องจะจำไว้ตลอด
-  // เครื่องที่เชื่อมแล้วแสดง QR ของลิงก์นี้ในเมนู "มือถือ & สำรองข้อมูล" ให้มือถือส่องเพื่อเชื่อมต่อ
-  const PAIR_KEY = "pt-pair";
-  const pairFromHash = (() => {
-    const m = location.hash.match(/^#pair=([A-Za-z0-9_-]+)$/);
-    if (!m) return null;
-    history.replaceState(null, "", location.pathname + location.search + "#/");
-    return m[1];
-  })();
-  const decodePair = (code) => {
-    try {
-      const txt = atob(code.replace(/-/g, "+").replace(/_/g, "/"));
-      const i = txt.indexOf("\n");
-      return i > 0 ? { email: txt.slice(0, i), password: txt.slice(i + 1) } : null;
-    } catch { return null; }
-  };
-  const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
-  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* */ } };
-
-  async function signInWithPair(code) {
-    const c = code && decodePair(code);
-    if (!c) return null;
-    const { data, error } = await sb.auth.signInWithPassword(c);
-    if (error) return null;
-    lsSet(PAIR_KEY, code);
-    return data.user;
-  }
-
-  function notPairedScreen(msg) {
-    const wrap = document.createElement("div");
-    wrap.style.cssText = "position:fixed;inset:0;z-index:9999;background:var(--ground,#F3F1EC);display:grid;place-items:center;padding:20px";
-    wrap.innerHTML = `<div style="width:min(420px,100%);background:#fff;border:1px solid var(--line,#E3E0D9);border-radius:18px;padding:26px;line-height:1.6">
-      <h1 style="margin:0 0 8px;font-size:24px">ParcelTrack</h1>
-      <p style="margin:0;color:var(--muted,#5B6169)">${msg || "เครื่องนี้ยังไม่ได้เชื่อมต่อ"}<br>
-      เปิด <b>ลิงก์เชื่อมเครื่อง</b> ที่ได้รับไว้ หรือบนเครื่องที่ใช้อยู่แล้ว ไปที่เมนู <b>มือถือ &amp; สำรองข้อมูล</b>
-      แล้วใช้มือถือส่อง QR "เชื่อมเครื่องนี้"</p></div>`;
-    document.body.appendChild(wrap);
-    return new Promise(() => {});   // รอจนกว่าจะเปิดด้วยลิงก์เชื่อมเครื่อง
-  }
-
-  sb.auth.onAuthStateChange((event) => {
-    if (event === "SIGNED_OUT" && uid) location.reload();
+  // ใช้คนเดียว ไม่ต้องล็อกอิน: เปิดเว็บแล้วโหลดข้อมูลชุดเดียวจาก Supabase ทันที
+  const ready = loadAll().catch((e) => {
+    throw new Error("เชื่อมต่อ Supabase ไม่ได้ (" + (e?.message || e) + ") ถ้า project ถูกหยุด ให้เข้า supabase.com แล้วกด Restore");
   });
-
-  const ready = (async () => {
-    let user = pairFromHash ? await signInWithPair(pairFromHash) : null;
-    if (!user) { const { data: { session } } = await sb.auth.getSession(); user = session?.user || null; }
-    if (!user) user = await signInWithPair(lsGet(PAIR_KEY));
-    if (!user) user = await notPairedScreen(pairFromHash ? "ลิงก์เชื่อมเครื่องไม่ถูกต้อง หรือเชื่อมต่อไม่ได้" : null);
-    uid = user.id; userEmail = user.email;
-    await loadAll();
-  })();
 
   // กลับมาที่หน้าเว็บ (เช่น สลับแอปบนมือถือ) ดึงข้อมูลล่าสุดจากอีกเครื่อง แล้ววาดหน้ารายการใหม่
   document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState !== "visible" || !uid || Date.now() - lastLoad < 20000) return;
+    if (document.visibilityState !== "visible" || Date.now() - lastLoad < 20000) return;
     try {
       await ready; await loadAll();
       if (/^#?\/?(orders|report)?$/.test(location.hash)) window.dispatchEvent(new HashChangeEvent("hashchange"));
@@ -894,16 +845,8 @@
 
   async function storageInfo() {
     await ready;
-    return { email: userEmail, orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size };
+    return { orders: orders.size, withdrawals: withdrawals.size, images: imageUrls.size };
   }
-  async function signOut() {
-    uid = null;
-    try { localStorage.removeItem(PAIR_KEY); } catch { /* */ }
-    await sb.auth.signOut();
-    location.reload();
-  }
-  // ลิงก์สำหรับเชื่อมเครื่องอื่น (มีเฉพาะบนเครื่องที่เชื่อมแล้ว)
-  const pairLink = () => { const c = lsGet(PAIR_KEY); return c ? location.href.split("#")[0] + "#pair=" + c : null; };
 
   // รูปที่ไม่มีในเครื่องนี้ แสดงเป็นกรอบว่างแทนรูปเสีย
   const MISSING = "data:image/svg+xml;charset=utf-8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="100%" height="100%" fill="#ECE9E3"/><text x="50%" y="50%" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#5B6169">ไม่มีรูปในเครื่องนี้</text></svg>');
@@ -911,6 +854,6 @@
   window.PTBackend = {
     ready, version: VERSION,
     imgUrl: (name) => imageUrls.get(name) || MISSING,
-    exportBackup, importFiles, storageInfo, signOut, pairLink, reload: async () => { await ready; await loadAll(); },
+    exportBackup, importFiles, storageInfo, reload: async () => { await ready; await loadAll(); },
   };
 })();
